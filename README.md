@@ -125,27 +125,53 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied.
   status counters, session hit/miss/rebind totals
 - `GET /rooter/backends`, `GET /rooter/sessions` — the same, split up
 - `GET /rooter/metrics` — Prometheus gauges and counters
-- `GET /rooter/forget?key=p:abc123` — drop one session, or all of them with
-  `key=*` (use it after you restart a backend and its cache is gone)
+- `GET /rooter/forget?key=p:abc123` — drop a session and every per-model binding
+  it holds; a bare id works too (`h:`/`p:` are tried for you), and `key=*` clears
+  everything (use it after you restart a backend and its cache is gone)
 
 ## Pointing Pi at it
 
-`~/.pi/agent/models.json`, on the provider you already use:
+`~/.pi/agent/models.json` - this is what the deployed `rooter` provider looks
+like:
 
 ```json
 {
-  "id": "qwen3.8-flash-next",
-  "name": "Qwen 3.8 Flash Next (rooter)",
-  "baseUrl": "http://127.0.0.1:8089/v1",
-  "apiKey": "Password1",
+  "baseUrl": "https://rooter.dev.initialed85.cc/v1",
   "api": "openai-completions",
-  "compat": { "sendSessionAffinityHeaders": true }
+  "apiKey": "Password1",
+  "compat": {
+    "supportsDeveloperRole": true,
+    "supportsReasoningEffort": true,
+    "sendSessionAffinityHeaders": true,
+    "sessionAffinityFormat": "openai"
+  },
+  "models": [
+    {
+      "id": "qwen3.8-flash-next-iq3_xxs",
+      "name": "Qwen 3.8 Flash Next (rooter -> strata)",
+      "api": "openai-responses"
+    },
+    {
+      "id": "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw",
+      "name": "Qwen 3.8 Flash Next (rooter -> sushi)"
+    }
+  ]
 }
 ```
 
-The `compat` line is optional — rooter falls back to prefix hashing if Pi says
-nothing. It is still worth setting, because an explicit session id keeps a
-session pinned even when you compact or branch the conversation.
+`api` can be set per model as well as per provider. Both backends answer
+`/v1/chat/completions` and `/v1/responses` (rooter proxies either, and keys
+sessions from both shapes), so each model here carries the API it is used to when
+reached directly and rooter just sits in front.
+
+Only the fields that matter for routing are spelled out; `contextWindow`,
+`maxTokens`, `reasoning`, `thinkingLevelMap` and `input` on each model are copied
+from the direct providers unchanged.
+
+`sendSessionAffinityHeaders` is optional - rooter falls back to prefix hashing if
+Pi says nothing. It is still worth setting, because an explicit session id keeps a
+conversation pinned even when you compact or branch it, whereas the prefix hash
+follows the transcript.
 
 Mind that rooter has **no auth** of its own: bind it to `127.0.0.1` (or a
 cluster-internal address) and keep the backend tokens out of the listener.
