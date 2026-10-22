@@ -1,0 +1,7 @@
+.git
+rooter
+*.log
+
+# the image copies exactly the built binary out of tmp/ and nothing else
+tmp/*
+!tmp/rooter
