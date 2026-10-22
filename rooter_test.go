@@ -860,6 +860,32 @@ func TestKeyExtraction(t *testing.T) {
 	if got := extractKey(http.Header{}, nil, ""); got.Key != "" || got.KeySource != "none" {
 		t.Errorf("empty = %+v", got)
 	}
+	// Responses API bodies carry the conversation in "input" and the system prompt
+	// in "instructions". Without those, every turn of a Pi-on-responses session
+	// would look like a brand new conversation and stickiness would do nothing.
+	rk := func(instr, first, latest string) []byte {
+		return []byte(fmt.Sprintf(`{"model":"m","instructions":%q,"input":[{"role":"user","content":[{"type":"input_text","text":%q}]},{"role":"assistant","content":[{"type":"output_text","text":"a"}]},{"role":"user","content":[{"type":"input_text","text":%q}]}]}`, instr, first, latest))
+	}
+	ra := extractKey(http.Header{}, rk("sys", "hello", "one"), "application/json")
+	rb := extractKey(http.Header{}, rk("sys", "hello", "two"), "application/json")
+	rc := extractKey(http.Header{}, rk("sys", "other", "two"), "application/json")
+	if ra.KeySource != "prefix" || ra.Model != "m" {
+		t.Errorf("responses prefix = %+v, want a prefix key for model m", ra)
+	}
+	if ra.Key != rb.Key {
+		t.Errorf("same responses conversation hashed differently: %s vs %s", ra.Key, rb.Key)
+	}
+	if ra.Key == rc.Key {
+		t.Errorf("different responses conversations hashed the same")
+	}
+	// The bare-string form of input is the whole prompt.
+	if bs := extractKey(http.Header{}, []byte(`{"model":"m","input":"just a prompt"}`), "application/json"); bs.KeySource != "prefix" || bs.Key == "" {
+		t.Errorf("bare input = %+v", bs)
+	}
+	// An explicit session field still beats the hash.
+	if sid := extractKey(http.Header{}, []byte(`{"model":"m","session_id":"s1","input":[{"role":"user","content":"hi"}]}`), "application/json"); sid.Key != "b:session_id:s1" {
+		t.Errorf("responses session_id = %+v", sid)
+	}
 }
 
 func TestBackendSpecParsing(t *testing.T) {
@@ -1048,5 +1074,36 @@ func TestForgetDropsEveryModelBindingOfASession(t *testing.T) {
 	}
 	if n := s.Stats()["sessions"].(int); n != 0 {
 		t.Errorf("sessions after Clear = %d, want 0", n)
+	}
+}
+
+// A Pi provider using api:openai-responses posts /v1/responses, where the
+// conversation sits in "input"/"instructions" rather than "messages". Two turns
+// of one conversation have to land on the same backend even with no session
+// header, or stickiness is dead for that API.
+func TestResponsesPathSticksByPrefix(t *testing.T) {
+	a := newFake(t, "a", "model-a", "")
+	b := newFake(t, "b", "model-a", "")
+	e := newEnv(t, []string{"a=" + a.url(), "b=" + b.url()}, nil)
+
+	first := `{"model":"model-a","instructions":"sys","input":[{"role":"user","content":[{"type":"input_text","text":"hello there"}]}]}`
+	second := `{"model":"model-a","instructions":"sys","input":[{"role":"user","content":[{"type":"input_text","text":"hello there"}]},{"role":"assistant","content":[{"type":"output_text","text":"hi"}]},{"role":"user","content":[{"type":"input_text","text":"and now?"}]}]}`
+
+	res1, out1 := e.do(postJSON("/v1/responses", first))
+	res2, out2 := e.do(postJSON("/v1/responses", second))
+	if res1.StatusCode != 200 || res2.StatusCode != 200 {
+		t.Fatalf("statuses %d %d (%s %s)", res1.StatusCode, res2.StatusCode, out1, out2)
+	}
+	if out1 != out2 {
+		t.Errorf("turns of one responses conversation landed differently: %s vs %s", out1, out2)
+	}
+	if st := e.sess.Stats(); st["hits"].(int64) < 1 {
+		t.Errorf("second turn was not a sticky hit: %v", st)
+	}
+	if p := a.lastPath(); p != "/v1/responses" {
+		t.Errorf("path rewritten: %q", p)
+	}
+	if body := a.lastBody(); !strings.Contains(body, "and now?") {
+		t.Errorf("body not passed through: %q", body)
 	}
 }

@@ -66,7 +66,10 @@ In order of preference:
    rooter**: a hash of the conversation *prefix* — the requested model, the
    system prompt and the first user turn (skipping over image parts so base64
    blobs do not matter). That is identical on every turn of a session and
-   different between sessions, so stickiness just works.
+   different between sessions, so stickiness just works. It reads both the
+   chat-completions shape (`messages`) and the Responses shape (`instructions`
+   plus `input`, as a bare string or an item array), so `api: openai-responses`
+   in Pi sticks too.
 
 Only the first `-scan-window` bytes (1 MiB) are read to work this out; bigger
 bodies are streamed through and, because they cannot be replayed, are not

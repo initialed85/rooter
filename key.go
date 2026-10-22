@@ -118,6 +118,18 @@ func scanJSON(body []byte) (requestInfo, bool) {
 			if err := scanMessages(dec, &systems, &first); err != nil {
 				ok = false
 			}
+		case "instructions":
+			// Responses API bodies carry the system prompt here instead of in a
+			// system message.
+			if v, err := decodeScalar(dec); err == nil {
+				systems = append(systems, clampCapture(v))
+			} else {
+				ok = false
+			}
+		case "input":
+			if err := scanInput(dec, &systems, &first); err != nil {
+				ok = false
+			}
 		case "model":
 			if v, err := decodeScalar(dec); err == nil {
 				scalars["model"] = v
@@ -200,6 +212,35 @@ func scanMessages(dec *json.Decoder, systems *[]string, first *string) error {
 	if d, isDelim := tok.(json.Delim); !isDelim || d != '[' {
 		return nil
 	}
+	return scanItems(dec, systems, first)
+}
+
+// scanInput handles the Responses API shape, where the conversation arrives as
+// either a bare string (the whole prompt) or an array of role/content items that
+// look much like messages, with content parts named input_text/output_text.
+// Rooter does not care about the part names: whatever the first user turn
+// serialises to is a stable prefix.
+func scanInput(dec *json.Decoder, systems *[]string, first *string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch v := tok.(type) {
+	case string:
+		if *first == "" {
+			*first = clampCapture(v)
+		}
+		return nil
+	case json.Delim:
+		if v == '[' {
+			return scanItems(dec, systems, first)
+		}
+	}
+	return nil
+}
+
+// scanItems walks the rest of an already-opened array of conversation items.
+func scanItems(dec *json.Decoder, systems *[]string, first *string) error {
 	for dec.More() {
 		var el struct {
 			Role    string          `json:"role"`
@@ -226,8 +267,18 @@ func scanMessages(dec *json.Decoder, systems *[]string, first *string) error {
 			}
 		}
 	}
-	_, err = dec.Token() // consume ']'
+	_, err := dec.Token() // consume ']'
 	return err
+}
+
+// clampCapture bounds a captured string the same way scanItems bounds a captured
+// message: the prefix of a conversation never changes, so a truncated capture is
+// still a stable key.
+func clampCapture(s string) string {
+	if len(s) > maxCapture {
+		return s[:maxCapture]
+	}
+	return s
 }
 
 func decodeScalar(dec *json.Decoder) (string, error) {
