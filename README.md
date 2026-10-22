@@ -26,7 +26,11 @@ that have free capacity.
   between models keeps a warm cache on each backend instead of ping-ponging a
   single binding. A session whose sticky backend is unhealthy waits for
   `-sticky-grace` (20s by default) so a blip does not shred its cache, then
-  rebinds elsewhere.
+  rebinds elsewhere. `-spill-after` is the same idea for a backend that is not
+  broken, only jammed: hold the cache that long, then move the session to a
+  backend with a free slot (logged as `spill`). It only fires when another
+  *eligible* backend exists, which for an explicit model id means an alias both
+  boxes advertise, or a meta model.
 - **Model aware** — rooter reads each backend's `/models` and will only send a
   request for `model-X` to a backend that claims it. **The model filter outranks
   stickiness**: a session bound to a backend that does not serve the model it now
@@ -37,6 +41,17 @@ that have free capacity.
   If nobody claims the model the request is a `404`; while any backend's list is
   still unknown or empty it does not constrain the choice, so llama.cpp's
   `default` and a cold router keep working.
+- **`auto` is the meta model** — the model names `auto` and `default` are not a
+  claim about weights, they mean "give me a GPU": the model filter is skipped,
+  a fresh session goes to the freest healthy backend, and it is then sticky like
+  any other session (bindings stay per *(session, model)*, so `auto` and an
+  explicit model id are tracked separately). Add more names with `-meta-model`.
+  This is how you use rooter as a balancer instead of a front door when the two
+  boxes hold different files: `auto` pools them, `qwen3.8-flash-next-iq3_xxs`
+  pins you to one. What you give up is the right to be surprised — llama.cpp
+  serves whatever it has loaded and echoes back the name you asked for, so an
+  `auto` answer may come from a different quant on different turns, and only
+  rooter's log or `rooter_backend_requests_total` says which.
 - **Concurrency is a real limit** — `-backend ...,concurrency=1` means one
   request in flight to that backend, full stop. Good for a box that hangs when
   you overload it.
@@ -112,6 +127,8 @@ Useful flags:
 | `-retries` / `-retry-wait` | `1` / `5s` | extra attempts on other backends |
 | `-health-interval` | `15s` | how often to re-poll `/models` (0 = start only) |
 | `-request-timeout` | `0` | hard cap on a generation request, queue included |
+| `-meta-model` | `auto`, `default` built in | extra names that mean "whichever backend is freest" |
+| `-spill-after` | `0` | after waiting this long on a busy sticky backend, take another eligible one (0 = never) |
 | `-scan-window` / `-max-body` | `1MiB` / `64MiB` | how much of a body is buffered for classification and replay |
 | `-xff` | off | let `X-Forwarded-For` be added upstream |
 | `-verbose` / `-quiet` | | log routing detail / log only failures |
@@ -147,6 +164,11 @@ like:
   },
   "models": [
     {
+      "id": "auto",
+      "name": "Qwen 3.8 Flash Next (rooter -> either box)",
+      "reasoning": true
+    },
+    {
       "id": "qwen3.8-flash-next-iq3_xxs",
       "name": "Qwen 3.8 Flash Next (rooter -> strata)",
       "api": "openai-responses"
@@ -158,6 +180,13 @@ like:
   ]
 }
 ```
+
+`/model rooter/auto` is the interesting one: it pools both boxes, so a new Pi
+session lands on whichever has slots free and then stays there for the rest of
+that conversation. `/model rooter/qwen3.8-flash-next-iq3_xxs` is a deliberate
+pin to one box. Note the id `auto` is not a real model - llama.cpp will answer it
+with the weights it has loaded, which is the whole point, and Pi cannot tell from
+the response which box replied.
 
 `api` can be set per model as well as per provider. Both backends answer
 `/v1/chat/completions` and `/v1/responses` (rooter proxies either, and keys

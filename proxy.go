@@ -180,11 +180,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	opts := SelectOpts{
-		Prefer:   bound,
-		Eligible: r.pool.ModelFilter(info.Model),
-		MaxWait:  r.cfg.MaxWait,
-		Grace:    r.cfg.StickyGrace,
-		NeedSlot: slot,
+		Prefer:     bound,
+		Eligible:   r.pool.ModelFilter(info.Model),
+		MaxWait:    r.cfg.MaxWait,
+		Grace:      r.cfg.StickyGrace,
+		SpillAfter: r.cfg.SpillAfter,
+		NeedSlot:   slot,
 	}
 	if !slot {
 		opts.MaxWait = 0
@@ -493,6 +494,13 @@ func (r *Router) logLine(req *http.Request, b *Backend, info requestInfo, out Ou
 	kind := "read"
 	if slot {
 		kind = "gen"
+		if out.Rebound {
+			if out.Spilled {
+				kind = "spill" // waited too long on a busy sticky backend
+			} else {
+				kind = "rebind"
+			}
+		}
 	}
 	model := ""
 	if info.Model != "" {

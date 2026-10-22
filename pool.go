@@ -25,8 +25,19 @@ type PoolOpts struct {
 	Poll           time.Duration // safety-net recheck while blocked
 	HealthInterval time.Duration
 	HealthTimeout  time.Duration
+	MetaModels     []string // model names that mean "whoever is freest", not a real model
 	Verbose        bool
 }
+
+// The built-in meta model names. Neither is a claim about weights: a request for
+// one is "give me a GPU", and which box answers is rooter's choice.
+//
+//	auto   the name to use, and the one Pi's /model should show
+//	default OpenAI's own "I don't care" placeholder, kept working
+const (
+	modelAuto    = "auto"
+	modelDefault = "default"
+)
 
 // Pool owns the backends and their concurrency slots.
 type Pool struct {
@@ -35,6 +46,7 @@ type Pool struct {
 	byName   map[string]*Backend
 	release  chan struct{} // closed and replaced whenever a slot frees or state changes
 	opts     PoolOpts
+	meta     map[string]bool // normalized MetaModels, fixed at start
 	client   *http.Client
 	log      *log.Logger
 }
@@ -51,6 +63,12 @@ func NewPool(backends []*Backend, opts PoolOpts, client *http.Client, logger *lo
 		client:   client,
 		log:      logger,
 	}
+	p.meta = map[string]bool{modelAuto: true, modelDefault: true}
+	for _, m := range opts.MetaModels {
+		if n := normalizeModel(m); n != "" {
+			p.meta[n] = true
+		}
+	}
 	for _, b := range backends {
 		b.Healthy = true // optimistic until proven otherwise
 		p.byName[b.Name] = b
@@ -62,6 +80,16 @@ func NewPool(backends []*Backend, opts PoolOpts, client *http.Client, logger *lo
 func (p *Pool) notify() {
 	close(p.release)
 	p.release = make(chan struct{})
+}
+
+// MetaNames lists the model names that mean "whichever backend is freest".
+func (p *Pool) MetaNames() []string {
+	out := make([]string, 0, len(p.meta))
+	for m := range p.meta {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (p *Pool) Backends() []*Backend {
@@ -98,17 +126,20 @@ func (p *Pool) MarkUnhealthy(b *Backend, why string) {
 
 // SelectOpts describes one routing decision.
 type SelectOpts struct {
-	Prefer   *Backend            // sticky backend for this session, may be nil
-	Eligible func(*Backend) bool // model support / extras; nil == everyone
-	MaxWait  time.Duration       // 0 == block forever
-	Grace    time.Duration       // how long to keep waiting on an unusable sticky backend
-	NeedSlot bool                // false => never block, never take a slot
+	Prefer     *Backend            // sticky backend for this session, may be nil
+	Eligible   func(*Backend) bool // model support / extras; nil == everyone
+	MaxWait    time.Duration       // 0 == block forever
+	Grace      time.Duration       // how long to keep waiting on an unusable sticky backend
+	SpillAfter time.Duration       // after this much waiting, go elsewhere if possible (0 == never)
+	NeedSlot   bool                // false => never block, never take a slot
+	Started    time.Time           // when this request began waiting; set by Acquire
 }
 
 type Outcome struct {
 	Backend *Backend
 	Waited  time.Duration
 	Rebound bool // gave up on the sticky backend
+	Spilled bool // ...only because it was busy for too long
 }
 
 // Acquire blocks until it can hand back a backend with a slot reserved, or the
@@ -117,6 +148,7 @@ func (p *Pool) Acquire(ctx context.Context, o SelectOpts) (*Backend, Outcome, er
 	start := time.Now()
 	var lostSticky time.Time
 	var out Outcome
+	o.Started = start
 	if !o.NeedSlot {
 		b := p.pick(ctx, o, &lostSticky)
 		if b == nil {
@@ -138,6 +170,7 @@ func (p *Pool) Acquire(ctx context.Context, o SelectOpts) (*Backend, Outcome, er
 			out.Backend = b
 			out.Waited = time.Since(start)
 			out.Rebound = o.Prefer != nil && b != o.Prefer
+			out.Spilled = out.Rebound && o.SpillAfter > 0 && out.Waited >= o.SpillAfter
 			p.touch(b, out.Waited)
 			return b, out, nil
 		}
@@ -195,6 +228,17 @@ func (p *Pool) try(o SelectOpts, lostSticky *time.Time) (*Backend, error) {
 		}
 		if o.Prefer.tryAcquire() {
 			return o.Prefer, nil
+		}
+		// The bound backend is healthy, just full. Normally that is worth queueing
+		// for: this session's prefix cache lives there and moving costs a re-prefill.
+		// But if the wait outlasts -spill-after and some other eligible backend has
+		// a free slot, holding on is no longer affinity, it is a queue.
+		if o.SpillAfter > 0 && !o.Started.IsZero() && now.Sub(o.Started) >= o.SpillAfter {
+			if rest := withoutBackend(elig, o.Prefer); len(rest) > 0 {
+				if free := eligibleFree(rest); len(free) > 0 {
+					return free[0], nil
+				}
+			}
 		}
 		return nil, errBusy // block; this session belongs here
 	}
@@ -268,6 +312,17 @@ func inSet(list []*Backend, b *Backend) bool {
 		}
 	}
 	return false
+}
+
+// withoutBackend copies a candidate list minus one entry.
+func withoutBackend(list []*Backend, b *Backend) []*Backend {
+	out := make([]*Backend, 0, len(list))
+	for _, x := range list {
+		if x != b {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func (p *Pool) healthyCountLocked() int {
@@ -512,7 +567,11 @@ func (p *Pool) HealthLoop(ctx context.Context) {
 // not wedge the router.
 func (p *Pool) ModelFilter(model string) func(*Backend) bool {
 	model = strings.TrimSpace(model)
-	if model == "" || model == "default" {
+	// A meta model is a name the client made up on purpose ("default" built in,
+	// anything in -meta-model): it is not a claim about weights, it is a request
+	// for whichever backend is freest. Sticking still applies afterwards, so one
+	// conversation keeps its cache on one box.
+	if model == "" || p.meta[normalizeModel(model)] {
 		return nil
 	}
 	p.mu.Lock()

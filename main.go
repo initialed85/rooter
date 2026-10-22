@@ -29,6 +29,8 @@ type Config struct {
 	HealthInterval time.Duration
 	HealthTimeout  time.Duration
 	RequestTimeout time.Duration
+	MetaModels     []string
+	SpillAfter     time.Duration
 	ScanWindow     int
 	MaxBody        int64
 	FreePaths      []string
@@ -72,6 +74,11 @@ Flags:
 		fmt.Fprint(os.Stderr, `
 Backend spec keys: name, url (or base), token (or api-key), concurrency (or slots).
 Shorthand: -backend 'strata=http://192.168.11.128:8088/v1,token=Password1,concurrency=4'
+
+A -meta-model name is not a model: a request for it may go to any healthy backend
+(auto and default are built in). Everything else is matched against each
+backend's /models, and a name no backend claims is a 404 rather than an answer
+from another model.
 `)
 	}
 	fs.StringVar(&c.Listen, "listen", ":8089", "address for rooter to listen on")
@@ -85,6 +92,8 @@ Shorthand: -backend 'strata=http://192.168.11.128:8088/v1,token=Password1,concur
 	fs.DurationVar(&c.HealthInterval, "health-interval", 15*time.Second, "how often to poll backend /models (0 = only at start)")
 	fs.DurationVar(&c.HealthTimeout, "health-timeout", 10*time.Second, "per-backend health check timeout")
 	fs.DurationVar(&c.RequestTimeout, "request-timeout", 0, "hard cap on a generation request, queue included (0 = none)")
+	fs.Var((*stringList)(&c.MetaModels), "meta-model", "extra model name that means \"whichever backend is freest\" (repeatable; auto and default are built in)")
+	fs.DurationVar(&c.SpillAfter, "spill-after", 0, "stop waiting on a busy sticky backend after this long and take another eligible one (0 = never)")
 	fs.IntVar(&c.ScanWindow, "scan-window", 1<<20, "leading body bytes always read to classify the session")
 	fs.Int64Var(&c.MaxBody, "max-body", 64<<20, "buffer bodies up to this many bytes so they can be replayed")
 	fs.Var((*stringList)(&c.FreePaths), "free-path", "path suffix that never needs a slot (repeatable)")
@@ -100,6 +109,9 @@ Shorthand: -backend 'strata=http://192.168.11.128:8088/v1,token=Password1,concur
 	}
 	if len(c.FreePaths) == 0 {
 		c.FreePaths = defaultFreePaths
+	}
+	if len(c.MetaModels) == 0 {
+		c.MetaModels = []string{modelAuto}
 	}
 	if c.Version {
 		return c, nil
@@ -140,6 +152,7 @@ func main() {
 		Poll:           time.Second,
 		HealthInterval: cfg.HealthInterval,
 		HealthTimeout:  cfg.HealthTimeout,
+		MetaModels:     cfg.MetaModels,
 		Verbose:        cfg.Verbose,
 	}, &http.Client{Timeout: cfg.HealthTimeout}, logger)
 	pool.CheckAll()

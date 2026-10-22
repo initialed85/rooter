@@ -61,6 +61,10 @@ func (r *Router) adminIndex(w http.ResponseWriter) {
 			b.Name, b.Base, b.busy(), b.Concurrency, b.Healthy, strings.Join(models, ","))
 		r.pool.mu.Unlock()
 	}
+	fmt.Fprintf(w, "\nmeta models (any backend, least loaded, then sticky): %s\n", strings.Join(r.pool.MetaNames(), " "))
+	if r.cfg.SpillAfter > 0 {
+		fmt.Fprintf(w, "spill after %s waiting on a busy sticky backend\n", r.cfg.SpillAfter)
+	}
 	fmt.Fprintf(w, "\nendpoints: /rooter/stats /rooter/metrics /rooter/backends /rooter/sessions /rooter/forget?key=K\n")
 }
 
@@ -88,6 +92,10 @@ func (r *Router) Stats() map[string]any {
 	}
 	s["backends"] = r.pool.Stats()
 	s["slots"] = r.pool.SlotSummary()
+	s["metaModels"] = r.pool.MetaNames()
+	if r.cfg.SpillAfter > 0 {
+		s["spillAfter"] = r.cfg.SpillAfter.String()
+	}
 	for k, v := range r.sessions.Stats() {
 		s["sessions_"+k] = v
 	}

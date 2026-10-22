@@ -197,6 +197,7 @@ func newEnv(t *testing.T, specs []string, tweak func(*Config)) *testEnv {
 	pool := NewPool(backends, PoolOpts{
 		Poll:          20 * time.Millisecond,
 		HealthTimeout: cfg.HealthTimeout,
+		MetaModels:    cfg.MetaModels,
 		Verbose:       cfg.Verbose,
 	}, &http.Client{Timeout: cfg.HealthTimeout}, lg)
 	sess := NewSessionStore(cfg.SessionTTL, cfg.MaxSessions, lg)
@@ -1109,5 +1110,118 @@ func TestResponsesPathSticksByPrefix(t *testing.T) {
 	}
 	if body := a.lastBody(); !strings.Contains(body, "and now?") {
 		t.Errorf("body not passed through: %q", body)
+	}
+}
+
+// -meta-model names are the "just give me a GPU" escape hatch: they are not
+// matched against any backend's /models, so a name nobody advertises is a 200
+// spread over the pool instead of a 404. Anything else is still refused.
+func TestMetaModelSkipsTheModelFilter(t *testing.T) {
+	a := newFake(t, "a", "model-a", "")
+	b := newFake(t, "b", "model-b", "")
+	e := newEnv(t, []string{"a=" + a.url(), "b=" + b.url()}, func(c *Config) {
+		c.MetaModels = []string{"pool-model"} // -meta-model: an extra name of our own
+	})
+	e.pool.CheckAll()
+
+	for _, name := range []string{"auto", "default", "pool-model"} {
+		res, out := e.do(withSession(postJSON("/v1/chat/completions", `{"model":"`+name+`","messages":[{"role":"user","content":"hi"}]}`), "meta-"+name))
+		if res.StatusCode != 200 {
+			t.Fatalf("meta model %q: got %d %s, want 200", name, res.StatusCode, out)
+		}
+	}
+	res2, out2 := e.do(postJSON("/v1/chat/completions", `{"model":"not-a-model","messages":[{"role":"user","content":"hi"}]}`))
+	if res2.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown model next to a meta model: got %d %s, want 404", res2.StatusCode, out2)
+	}
+	if n := a.genCounts() + b.genCounts(); n != 3 {
+		t.Errorf("backends served %d, want 3 (one per meta name)", n)
+	}
+}
+
+// A meta model only means "not model-pinned": a run of fresh sessions still has
+// to land on more than one backend, otherwise it is just a wider 404 filter.
+func TestMetaModelSpreadsNewSessions(t *testing.T) {
+	a := newFake(t, "a", "model-a", "")
+	b := newFake(t, "b", "model-b", "")
+	e := newEnv(t, []string{"a=" + a.url(), "b=" + b.url()}, func(c *Config) {
+		c.MetaModels = []string{"pool-model"}
+	})
+	e.pool.CheckAll()
+
+	for i := 1; i <= 4; i++ {
+		body := fmt.Sprintf(`{"model":"auto","messages":[{"role":"user","content":"session %d"}]}`, i)
+		res, out := e.do(withSession(postJSON("/v1/chat/completions", body), fmt.Sprintf("spread-%d", i)))
+		if res.StatusCode != 200 {
+			t.Fatalf("probe %d: got %d %s", i, res.StatusCode, out)
+		}
+	}
+	na, nb := a.genCounts(), b.genCounts()
+	if na == 0 || nb == 0 {
+		t.Errorf("4 sessions on a meta model went a=%d b=%d, want both backends used", na, nb)
+	}
+	if st := e.sess.Stats(); fmt.Sprint(st["sessions"]) != "4" || fmt.Sprint(st["bindings"]) != "4" {
+		t.Errorf("session store %v, want 4 sessions with 4 bindings", st)
+	}
+}
+
+// With -spill-after, a session whose backend is jammed waits for a slot only so
+// long before moving to a backend that has one. Without it (the default) the
+// session holds its cache and queues, which TestStickySessionWaitsRatherThan
+// -Leaks checks from the other side.
+func TestSpillAfterMovesASessionOffABusyBackend(t *testing.T) {
+	a := newFake(t, "a", "model-x", "")
+	b := newFake(t, "b", "model-x", "")
+	a.setLatency(600 * time.Millisecond)
+	e := newEnv(t, []string{"a=" + a.url() + ",concurrency=1", "b=" + b.url() + ",concurrency=2"}, func(c *Config) {
+		c.SpillAfter = 120 * time.Millisecond
+		c.MaxWait = 10 * time.Second
+	})
+	e.pool.CheckAll()
+
+	// Turn one: nothing is busy, so the session binds to the first backend.
+	first := withSession(postJSON("/v1/chat/completions", `{"model":"model-x","messages":[{"role":"user","content":"one"}]}`), "spillme")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		res, out, err := e.doErr(first)
+		if res == nil || res.StatusCode != 200 {
+			t.Errorf("first turn: res=%v body=%s err=%v", res, out, err)
+		}
+	}()
+	// Wait until turn one has actually taken a's slot, then start turn two.
+	var name string
+	var ok bool
+	for i := 0; i < 100; i++ {
+		name, ok = e.sess.Get(BindKey("h:spillme", "model-x"))
+		if _, inflight, _ := a.counts(); ok && name == "a" && inflight > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !ok || name != "a" {
+		<-done
+		na, ni, _ := a.counts()
+		nb, nbi, _ := b.counts()
+		t.Fatalf("session did not bind to a first: %q ok=%v; a req=%d inflight=%d b req=%d inflight=%d stats=%v", name, ok, na, ni, nb, nbi, e.sess.Stats())
+	}
+
+	start := time.Now()
+	second := withSession(postJSON("/v1/chat/completions", `{"model":"model-x","messages":[{"role":"user","content":"two"}]}`), "spillme")
+	res, out := e.do(second)
+	elapsed := time.Since(start)
+	<-done
+
+	if res.StatusCode != 200 {
+		t.Fatalf("spilled turn: got %d %s", res.StatusCode, out)
+	}
+	if elapsed < 120*time.Millisecond {
+		t.Errorf("second turn took %s; it should have waited out -spill-after first", elapsed)
+	}
+	if na, nb := a.genCounts(), b.genCounts(); na != 1 || nb != 1 {
+		t.Errorf("a=%d b=%d, want the stalled turn to spill to b (1 each)", na, nb)
+	}
+	if name, ok := e.sess.Get(BindKey("h:spillme", "model-x")); !ok || name != "b" {
+		t.Errorf("session binding after spilling: %q ok=%v, want b", name, ok)
 	}
 }
