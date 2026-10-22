@@ -584,6 +584,10 @@ func TestModelEligibility(t *testing.T) {
 	if res, out := e.do(req); res.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown model: got %d %s, want 404", res.StatusCode, out)
 	}
+	// A typo is not overload: rooter_rejected_total is the capacity metric.
+	if n := e.router.Stats()["rejected"].(int64); n != 0 {
+		t.Errorf("a 404 bumped the rejected counter to %d", n)
+	}
 	// "default" is what llama.cpp clients send when they do not care; it is a
 	// request for anything, not a request for a model that does not exist.
 	req = withSession(postJSON("/v1/chat/completions", `{"model":"default","messages":[{"role":"user","content":"hi"}]}`), "dflt")

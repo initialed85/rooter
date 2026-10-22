@@ -204,7 +204,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if err != nil {
 		r.mu.Lock()
-		r.rejected++
+		// "rejected" is the capacity metric - it should mean "somebody was full".
+		// A request for a model nothing serves is a 404, not a lack of slots, and
+		// counting it here would make a typo look like overload on the dashboard.
+		if statusForErr(err) == http.StatusServiceUnavailable {
+			r.rejected++
+		}
 		r.byStatus[statusForErr(err)]++
 		r.mu.Unlock()
 		r.noBackend(w, req, info, err, out, start)
