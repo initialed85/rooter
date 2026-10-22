@@ -35,8 +35,13 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 		w.Write(b)
 	case "rooter/forget":
 		key := req.URL.Query().Get("key")
-		r.sessions.Unbind(key)
-		fmt.Fprintf(w, "forgotten %q\n", key)
+		n := 0
+		if key == "*" {
+			n = r.sessions.Clear()
+		} else {
+			n = r.sessions.UnbindSession(key)
+		}
+		fmt.Fprintf(w, "forgotten %d binding(s) for %q\n", n, key)
 	default:
 		errJSON(w, http.StatusNotFound, "not found: "+req.URL.Path)
 	}

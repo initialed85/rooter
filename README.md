@@ -22,12 +22,21 @@ that have free capacity.
   slot. If every eligible backend is full, *block* until a slot frees rather
   than bouncing the session onto a cold cache.
 - **Existing session** — go back to the same backend, and block if its slots are
-  full. A session whose sticky backend is unhealthy waits for `-sticky-grace`
-  (20s by default) so a blip does not shred its cache, then rebinds elsewhere.
+  full. Bindings are per *(session, model)*, so one conversation that switches
+  between models keeps a warm cache on each backend instead of ping-ponging a
+  single binding. A session whose sticky backend is unhealthy waits for
+  `-sticky-grace` (20s by default) so a blip does not shred its cache, then
+  rebinds elsewhere.
 - **Model aware** — rooter reads each backend's `/models` and will only send a
-  request for `model-X` to a backend that claims it. If nobody claims it (or a
-  list has not loaded yet) it does not constrain the choice, so llama.cpp's
-  `default` keeps working.
+  request for `model-X` to a backend that claims it. **The model filter outranks
+  stickiness**: a session bound to a backend that does not serve the model it now
+  wants is moved, not held. This matters because llama.cpp answers a model it has
+  not loaded with the model it *has* — sticking here would be a silent model swap
+  that reads like a bad answer. A `:quant` tag on the requested id
+  (`repo/GGUF:UD-Q6_K_XL`) is folded away, since `/models` reports the base id.
+  If nobody claims the model the request is a `404`; while any backend's list is
+  still unknown or empty it does not constrain the choice, so llama.cpp's
+  `default` and a cold router keep working.
 - **Concurrency is a real limit** — `-backend ...,concurrency=1` means one
   request in flight to that backend, full stop. Good for a box that hangs when
   you overload it.
@@ -62,6 +71,9 @@ In order of preference:
 Only the first `-scan-window` bytes (1 MiB) are read to work this out; bigger
 bodies are streamed through and, because they cannot be replayed, are not
 retried onto another backend.
+
+The key is then paired with the requested model, because a session that uses two
+models on two backends should stay warm on both.
 
 ## Building
 

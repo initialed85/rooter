@@ -164,8 +164,11 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	info := extractKey(req.Header, body, req.Header.Get("Content-Type"))
 
 	slot := needsSlot(req.Method, req.URL.Path, r.cfg.FreePaths)
+	// Bindings are per (session, model): one conversation that switches models
+	// should stay warm on both backends rather than ping-pong a single binding.
+	bindKey := BindKey(info.Key, info.Model)
 	var bound *Backend
-	if name, ok := r.sessions.Get(info.Key); ok {
+	if name, ok := r.sessions.Get(bindKey); ok {
 		bound = r.pool.Lookup(name)
 	}
 
@@ -209,8 +212,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if slot {
 		defer func() { r.pool.Release(held) }()
-		if info.Key != "" {
-			r.sessions.Bind(info.Key, held.Name)
+		if bindKey != "" {
+			r.sessions.Bind(bindKey, held.Name)
 		}
 	}
 
@@ -283,7 +286,7 @@ func (r *Router) dispatch(ctx context.Context, w http.ResponseWriter, req *http.
 		out.Waited += o2.Waited
 		out.Rebound = true
 		if slot && info.Key != "" {
-			r.sessions.Bind(info.Key, nb.Name)
+			r.sessions.Bind(BindKey(info.Key, info.Model), nb.Name)
 		}
 		if r.cfg.Verbose {
 			r.log.Printf("retrying %s %s on %s (after %v)", req.Method, req.URL.Path, nb.Name, res.err)
@@ -434,6 +437,10 @@ func statusForErr(err error) int {
 	switch {
 	case err == nil:
 		return 200
+	case errors.Is(err, errNoModel):
+		// A model no backend claims will never succeed, whatever the client
+		// retries. llama.cpp would answer it with a different model, silently.
+		return http.StatusNotFound
 	case errors.Is(err, errMaxWait), errors.Is(err, errNoCandidate), errors.Is(err, errBusy):
 		return http.StatusServiceUnavailable
 	default:
@@ -445,6 +452,8 @@ func (r *Router) noBackend(w http.ResponseWriter, req *http.Request, info reques
 	code := statusForErr(err)
 	msg := "no backend available"
 	switch {
+	case errors.Is(err, errNoModel):
+		msg = fmt.Sprintf("no backend serves model %q", info.Model)
 	case errors.Is(err, errNoCandidate):
 		if info.Model != "" {
 			msg = fmt.Sprintf("no healthy backend serves model %q", info.Model)
@@ -464,7 +473,11 @@ func (r *Router) noBackend(w http.ResponseWriter, req *http.Request, info reques
 	if errors.Is(err, context.Canceled) {
 		return // client hung up; nothing to say
 	}
-	w.Header().Set("Retry-After", "1")
+	if code != http.StatusNotFound {
+		// Only a busy/unavailable answer is worth retrying; telling a client to
+		// retry a 404 just teaches it to hammer a model that does not exist.
+		w.Header().Set("Retry-After", "1")
+	}
 	errJSON(w, code, msg)
 }
 
@@ -476,8 +489,12 @@ func (r *Router) logLine(req *http.Request, b *Backend, info requestInfo, out Ou
 	if slot {
 		kind = "gen"
 	}
-	r.log.Printf("%s %s -> %s [%s key=%s(%s) status=%d bytes=%d wait=%s ttfb=%s total=%s%s",
-		req.Method, req.URL.Path, b.Name, kind, shortKey(info.Key), info.KeySource,
+	model := ""
+	if info.Model != "" {
+		model = " model=" + info.Model
+	}
+	r.log.Printf("%s %s -> %s [%s key=%s(%s)%s status=%d bytes=%d wait=%s ttfb=%s total=%s%s",
+		req.Method, req.URL.Path, b.Name, kind, shortKey(info.Key), info.KeySource, model,
 		res.status, res.bytes, out.Waited.Round(time.Millisecond), res.ttfb.Round(time.Millisecond),
 		time.Since(start).Round(time.Millisecond), errSuffix(res))
 }

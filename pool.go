@@ -17,6 +17,7 @@ import (
 var (
 	errBusy        = errors.New("all candidates busy")
 	errNoCandidate = errors.New("no backend can serve this request")
+	errNoModel     = errors.New("no backend serves the requested model")
 	errMaxWait     = errors.New("timed out waiting for a free slot")
 )
 
@@ -119,7 +120,7 @@ func (p *Pool) Acquire(ctx context.Context, o SelectOpts) (*Backend, Outcome, er
 	if !o.NeedSlot {
 		b := p.pick(ctx, o, &lostSticky)
 		if b == nil {
-			return nil, out, errNoCandidate
+			return nil, out, p.noCandidateErr(o.Eligible)
 		}
 		out.Backend = b
 		out.Rebound = o.Prefer != nil && b != o.Prefer
@@ -140,7 +141,8 @@ func (p *Pool) Acquire(ctx context.Context, o SelectOpts) (*Backend, Outcome, er
 			p.touch(b, out.Waited)
 			return b, out, nil
 		}
-		if errors.Is(err, errNoCandidate) {
+		if errors.Is(err, errNoCandidate) || errors.Is(err, errNoModel) {
+			// Nothing to wait for: no backend could ever take this request.
 			out.Waited = time.Since(start)
 			return nil, out, err
 		}
@@ -175,11 +177,18 @@ func (p *Pool) try(o SelectOpts, lostSticky *time.Time) (*Backend, error) {
 
 	elig := p.eligibleLocked(o.Eligible)
 	if len(elig) == 0 {
-		return nil, errNoCandidate
+		// "nothing is healthy" and "nothing serves this model" look the same here
+		// but are not the same failure: the first is a 503 worth retrying, the
+		// second is a 404 that will never succeed.
+		return nil, p.noCandidateErrLocked(o.Eligible)
 	}
 
-	// 1. sticky: keep the prefix cache warm on the backend we used before.
-	if o.Prefer != nil && p.usableLocked(o.Prefer, now) {
+	// 1. sticky: keep the prefix cache warm on the backend we used before - but
+	// only if that backend is still allowed to serve this request. A bound backend
+	// that does not have the requested model must not be used: llama.cpp answers a
+	// model it does not have with whatever it *does* have loaded, so sticking here
+	// silently swaps the model on the client.
+	if o.Prefer != nil && p.usableLocked(o.Prefer, now) && inSet(elig, o.Prefer) {
 		*lostSticky = time.Time{}
 		if !o.NeedSlot {
 			return o.Prefer, nil
@@ -190,17 +199,18 @@ func (p *Pool) try(o SelectOpts, lostSticky *time.Time) (*Backend, error) {
 		return nil, errBusy // block; this session belongs here
 	}
 
-	// 2. sticky backend is unusable (down / no longer serves the model). Hold
-	//    the line briefly so a blip does not shred the cache, then rebind.
-	if o.Prefer != nil {
+	// 2. sticky backend is unusable for this request. If it is merely unhealthy,
+	//    hold the line briefly so a blip does not shred the cache, then rebind. If
+	//    it is healthy but simply cannot serve the requested model, that is not a
+	//    blip - rebind straight away, or every model switch would stall for
+	//    -sticky-grace.
+	if o.Prefer != nil && p.usableLocked(o.Prefer, now) {
+		*lostSticky = time.Time{}
+	} else if o.Prefer != nil {
 		if lostSticky.IsZero() {
 			*lostSticky = now
 		}
 		if o.Grace > 0 && now.Sub(*lostSticky) < o.Grace {
-			// Only worth waiting if some backend could in principle take us.
-			if len(elig) == 0 {
-				return nil, errNoCandidate
-			}
 			return nil, errBusy
 		}
 	}
@@ -222,14 +232,52 @@ func (p *Pool) pick(ctx context.Context, o SelectOpts, lostSticky *time.Time) *B
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	if o.Prefer != nil && p.usableLocked(o.Prefer, now) {
-		return o.Prefer
-	}
 	elig := p.eligibleLocked(o.Eligible)
 	if len(elig) == 0 {
 		return nil
 	}
+	// Same rule as try(): stickiness never outranks the model filter.
+	if o.Prefer != nil && p.usableLocked(o.Prefer, now) && inSet(elig, o.Prefer) {
+		return o.Prefer
+	}
 	return leastLoaded(elig)
+}
+
+// noCandidateErr says *why* there are no candidates, so the caller can answer
+// 503 (try again) or 404 (that model does not exist here).
+func (p *Pool) noCandidateErr(filter func(*Backend) bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.noCandidateErrLocked(filter)
+}
+
+// noCandidateErrLocked is the caller-must-hold-p.mu form; try() reaches for it
+// while already holding the lock, and taking it twice would self-deadlock.
+func (p *Pool) noCandidateErrLocked(filter func(*Backend) bool) error {
+	if filter != nil && p.healthyCountLocked() > 0 {
+		return errNoModel
+	}
+	return errNoCandidate
+}
+
+// inSet reports whether b is one of the candidates in list.
+func inSet(list []*Backend, b *Backend) bool {
+	for _, x := range list {
+		if x == b {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Pool) healthyCountLocked() int {
+	n := 0
+	for _, b := range p.backends {
+		if b.Healthy {
+			n++
+		}
+	}
+	return n
 }
 
 // eligibleLocked returns candidates that are healthy and can serve the request.
@@ -469,21 +517,46 @@ func (p *Pool) ModelFilter(model string) func(*Backend) bool {
 	}
 	p.mu.Lock()
 	serves := false
+	unknownLists := 0
+	want := normalizeModel(model)
 	allowed := make(map[string]bool, len(p.backends))
 	for _, b := range p.backends {
-		if b.Models == nil {
-			continue // unknown: do not constrain this backend
+		if len(b.Models) == 0 {
+			unknownLists++
+			continue // never polled, or polled and reported nothing: no basis to exclude it
 		}
-		if b.Models[model] {
-			allowed[b.Name] = true
-			serves = true
+		for id := range b.Models {
+			if normalizeModel(id) == want {
+				allowed[b.Name] = true
+				serves = true
+				break
+			}
 		}
 	}
 	p.mu.Unlock()
-	if !serves {
+	if serves {
+		return func(b *Backend) bool { return allowed[b.Name] }
+	}
+	// Nothing claims the model. Refuse it only when every backend's model list is
+	// actually known and non-empty, otherwise a backend that has not been polled
+	// yet would be hidden behind a hard 404. Refusing at all is the point: a wrong
+	// model id has to become a visible error instead of an answer from a different
+	// model, which is exactly what llama.cpp does when handed one.
+	if unknownLists > 0 {
 		return nil
 	}
-	return func(b *Backend) bool { return allowed[b.Name] }
+	return func(*Backend) bool { return false }
+}
+
+// normalizeModel folds away the quantisation tag llama.cpp clients often append
+// to an id ("repo/GGUF:UD-Q6_K_XL"), since /models reports the base id. Only a
+// trailing ":tag" after the last separator counts, so scheme colons survive.
+func normalizeModel(m string) string {
+	m = strings.ToLower(strings.TrimSpace(m))
+	if i := strings.LastIndexByte(m, ':'); i > strings.LastIndexByte(m, '/') {
+		m = m[:i]
+	}
+	return m
 }
 
 func snippet(b []byte) string {

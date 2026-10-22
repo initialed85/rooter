@@ -531,7 +531,7 @@ func TestRetryOntoAnotherBackend(t *testing.T) {
 	if !strings.Contains(body, "b") {
 		t.Errorf("response should come from b: %s", body)
 	}
-	if got, ok := e.sess.Get("h:retry-1"); !ok || got != "b" {
+	if got, ok := e.sess.Get(BindKey("h:retry-1", "test-model")); !ok || got != "b" {
 		t.Errorf("session not rebound onto b after the retry: %q ok=%v", got, ok)
 	}
 }
@@ -576,15 +576,98 @@ func TestModelEligibility(t *testing.T) {
 	if n := a.genCounts(); n != 0 {
 		t.Errorf("model-b requests leaked to a: %d", n)
 	}
-	// A model nobody lists must not be blocked: llama.cpp callers often send
-	// "default", and a stale /models list should never wedge a request.
+	// A model nobody lists used to be sent anywhere, which meant llama.cpp answered
+	// it with whichever model it happened to have loaded - a silent model swap that
+	// looks exactly like a bad answer from the model the user asked for. With every
+	// backend's list known, that has to become a visible 404.
 	req := withSession(postJSON("/v1/chat/completions", `{"model":"model-zzz","messages":[{"role":"user","content":"hi"}]}`), "zzz")
-	if res, out := e.do(req); res.StatusCode != 200 {
-		t.Errorf("unknown model rejected: %d %s", res.StatusCode, out)
+	if res, out := e.do(req); res.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown model: got %d %s, want 404", res.StatusCode, out)
 	}
+	// "default" is what llama.cpp clients send when they do not care; it is a
+	// request for anything, not a request for a model that does not exist.
 	req = withSession(postJSON("/v1/chat/completions", `{"model":"default","messages":[{"role":"user","content":"hi"}]}`), "dflt")
 	if res, out := e.do(req); res.StatusCode != 200 {
 		t.Errorf("model=default rejected: %d %s", res.StatusCode, out)
+	}
+}
+
+// The regression this guards: a session bound to backend a must not be kept
+// there when it asks for a model only b serves. Stickiness outranking the model
+// filter is not a cache miss, it is a silent model swap, because llama.cpp
+// answers a model it does not have with the one it does.
+func TestStickyYieldsToModelEligibility(t *testing.T) {
+	a := newFake(t, "a", "model-a", "")
+	b := newFake(t, "b", "model-b", "")
+	e := newEnv(t, []string{"a=" + a.url(), "b=" + b.url()}, nil)
+	e.pool.CheckAll()
+
+	owner := map[string]string{"model-a": "a", "model-b": "b"}
+	// Ping-pong the two models on one session id. Each must land on its own
+	// backend every time, so neither backend's cache gets thrown away.
+	for i, m := range []string{"model-a", "model-b", "model-a", "model-b"} {
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"turn %d"}]}`, m, i)
+		res, out := e.do(withSession(postJSON("/v1/chat/completions", body), "switcher"))
+		if res.StatusCode != 200 {
+			t.Fatalf("turn %d (%s): %d %s", i, m, res.StatusCode, out)
+		}
+		if want := `{"backend":"` + owner[m] + `"}`; out != want {
+			t.Errorf("turn %d model %s -> %s, want %s", i, m, out, want)
+		}
+	}
+	if n := a.genCounts(); n != 2 {
+		t.Errorf("a served %d turns, want 2", n)
+	}
+	if n := b.genCounts(); n != 2 {
+		t.Errorf("b served %d turns, want 2", n)
+	}
+	if got, _ := e.sess.Get(BindKey("h:switcher", "model-a")); got != "a" {
+		t.Errorf("model-a binding = %q, want a", got)
+	}
+	if got, _ := e.sess.Get(BindKey("h:switcher", "model-b")); got != "b" {
+		t.Errorf("model-b binding = %q, want b", got)
+	}
+}
+
+// Clients append a quant tag to the repo id ("...GGUF:UD-Q6_K_XL") while /models
+// reports the base id, so the two have to be treated as the same model or every
+// such request becomes a 404.
+func TestQuantTaggedAliasRoutesToItsBackend(t *testing.T) {
+	a := newFake(t, "a", "repo/GGUF", "")
+	b := newFake(t, "b", "other-model", "")
+	e := newEnv(t, []string{"a=" + a.url(), "b=" + b.url()}, nil)
+	e.pool.CheckAll()
+
+	body := `{"model":"repo/GGUF:UD-Q6_K_XL","messages":[{"role":"user","content":"hi"}]}`
+	res, out := e.do(withSession(postJSON("/v1/chat/completions", body), "alias"))
+	if res.StatusCode != 200 {
+		t.Fatalf("quant-tagged alias: %d %s", res.StatusCode, out)
+	}
+	if out != `{"backend":"a"}` {
+		t.Errorf("alias routed to %s, want a", out)
+	}
+	if n := b.genCounts(); n != 0 {
+		t.Errorf("alias leaked %d requests to the wrong backend", n)
+	}
+}
+
+// A backend that has never answered /models cannot be held against a model id it
+// might well serve; refusing the request there would be a 404 out of ignorance.
+func TestUnpolledBackendKeepsModelMatchingLenient(t *testing.T) {
+	a := newFake(t, "a", "model-a", "")
+	b := newFake(t, "b", "model-b", "")
+	e := newEnv(t, []string{"a=" + a.url(), "b=" + b.url()}, nil)
+	e.pool.CheckAll()
+	// Lookup takes the pool lock itself, so it has to happen outside it.
+	unpolled := e.pool.Lookup("b")
+	e.pool.mu.Lock()
+	unpolled.Models = nil // pretend /models has never been answered
+	e.pool.mu.Unlock()
+
+	body := `{"model":"model-zzz","messages":[{"role":"user","content":"hi"}]}`
+	res, out := e.do(withSession(postJSON("/v1/chat/completions", body), "lenient"))
+	if res.StatusCode != 200 {
+		t.Errorf("unknown model with an unpolled backend: %d %s, want 200", res.StatusCode, out)
 	}
 }
 
@@ -620,7 +703,7 @@ func TestStickySessionRebindsWhenItsBackendDies(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("%d %s", res.StatusCode, body)
 	}
-	name, ok := e.sess.Get("h:die-hard")
+	name, ok := e.sess.Get(BindKey("h:die-hard", "test-model"))
 	if !ok {
 		t.Fatal("session was not bound")
 	}
@@ -631,7 +714,7 @@ func TestStickySessionRebindsWhenItsBackendDies(t *testing.T) {
 	if res2.StatusCode != 200 {
 		t.Fatalf("after kill: %d %s", res2.StatusCode, body2)
 	}
-	if got, _ := e.sess.Get("h:die-hard"); got == name {
+	if got, _ := e.sess.Get(BindKey("h:die-hard", "test-model")); got == name {
 		t.Errorf("session stayed bound to the dead backend %s", got)
 	}
 	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
@@ -649,7 +732,8 @@ func TestStickySessionWaitsForItsOwnBackend(t *testing.T) {
 
 	go e.do(withSession(postJSON("/v1/chat/completions", chatBody("slow", "hi")), "slow"))
 	time.Sleep(60 * time.Millisecond)
-	e.sess.Bind("h:mine", "a")
+	// Bound the way a real request would bind it: per (session, model).
+	e.sess.Bind(BindKey("h:mine", "test-model"), "a")
 	req := withSession(postJSON("/v1/chat/completions", chatBody("mine", "hi")), "mine")
 	start := time.Now()
 	res, body := e.do(req)
@@ -939,5 +1023,30 @@ func TestOverCapBodyRejectsGracefully(t *testing.T) {
 	}
 	if res.StatusCode != 200 {
 		t.Fatalf("status %d %s", res.StatusCode, body)
+	}
+}
+
+func TestForgetDropsEveryModelBindingOfASession(t *testing.T) {
+	s := NewSessionStore(time.Hour, 100, nil)
+	s.Bind(BindKey("h:abc", "model-a"), "a")
+	s.Bind(BindKey("h:abc", "model-b"), "b")
+	s.Bind(BindKey("h:other", "model-a"), "a")
+	if st := s.Stats(); st["sessions"].(int) != 2 || st["bindings"].(int) != 3 {
+		t.Errorf("stats = %v/%v, want 2 sessions / 3 bindings", st["sessions"], st["bindings"])
+	}
+
+	// The admin page and clients only ever see the prefix-less key, so forgetting
+	// by "abc" has to reach both per-model bindings.
+	if n := s.UnbindSession("abc"); n != 2 {
+		t.Errorf("UnbindSession(abc) dropped %d bindings, want 2", n)
+	}
+	if _, ok := s.Get(BindKey("h:other", "model-a")); !ok {
+		t.Error("unrelated session was collateral damage")
+	}
+	if n := s.Clear(); n != 1 {
+		t.Errorf("Clear dropped %d bindings, want 1", n)
+	}
+	if n := s.Stats()["sessions"].(int); n != 0 {
+		t.Errorf("sessions after Clear = %d, want 0", n)
 	}
 }
