@@ -34,6 +34,8 @@ type Config struct {
 	ScanWindow     int
 	MaxBody        int64
 	FreePaths      []string
+	APIKeys        []string
+	PublicPaths    []string
 	XForwarded     bool
 	Verbose        bool
 	Quiet          bool
@@ -79,6 +81,10 @@ A -meta-model name is not a model: a request for it may go to any healthy backen
 (auto and default are built in). Everything else is matched against each
 backend's /models, and a name no backend claims is a 404 rather than an answer
 from another model.
+
+With -api-key set, every request must carry that key (Authorization: Bearer or
+x-api-key) except the health probes in -public-path. That is what makes it safe to
+publish rooter on a routable address; the backends' own tokens stay in here.
 `)
 	}
 	fs.StringVar(&c.Listen, "listen", ":8089", "address for rooter to listen on")
@@ -97,6 +103,8 @@ from another model.
 	fs.IntVar(&c.ScanWindow, "scan-window", 1<<20, "leading body bytes always read to classify the session")
 	fs.Int64Var(&c.MaxBody, "max-body", 64<<20, "buffer bodies up to this many bytes so they can be replayed")
 	fs.Var((*stringList)(&c.FreePaths), "free-path", "path suffix that never needs a slot (repeatable)")
+	fs.Var((*stringList)(&c.APIKeys), "api-key", "key clients must present (Authorization: Bearer or x-api-key); repeat for more than one; empty = no front-door auth")
+	fs.Var((*stringList)(&c.PublicPaths), "public-path", "path suffix reachable without -api-key (repeatable)")
 	fs.BoolVar(&c.XForwarded, "xff", false, "let X-Forwarded-For be added to upstream requests")
 	fs.BoolVar(&c.Verbose, "verbose", false, "log retries, queue detail and more")
 	fs.BoolVar(&c.Quiet, "quiet", false, "only log requests that failed")
@@ -109,6 +117,9 @@ from another model.
 	}
 	if len(c.FreePaths) == 0 {
 		c.FreePaths = defaultFreePaths
+	}
+	if len(c.PublicPaths) == 0 {
+		c.PublicPaths = defaultPublicPaths
 	}
 	if len(c.MetaModels) == 0 {
 		c.MetaModels = []string{modelAuto}
@@ -183,6 +194,14 @@ func main() {
 		names = append(names, fmt.Sprintf("%s(%d)", b.Name, b.Concurrency))
 	}
 	logger.Printf("listening on %s -> %s", ln.Addr(), strings.Join(names, " "))
+	switch auth := newAuthGuard(cfg); {
+	case auth.enabled():
+		logger.Printf("api key required on the front door: %d key(s), %s reachable without one",
+			auth.keyCount(), strings.Join(cfg.PublicPaths, " "))
+	case !listenIsLoopback(cfg.Listen):
+		// The point of this line is that nobody has to discover it later.
+		logger.Printf("WARNING: no -api-key and %s is reachable beyond this host; anyone who can route to it can use your backends and read /rooter/stats", cfg.Listen)
+	}
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("rooter: serve: %v", err)
 	}

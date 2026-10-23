@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -164,6 +165,24 @@ func (f *fakeBackend) setBreak(b bool) {
 	f.mu.Unlock()
 }
 
+// safeBuf is a log sink a test can read while handlers are still writing.
+type safeBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *safeBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 type testEnv struct {
 	t      *testing.T
 	router *Router
@@ -171,6 +190,7 @@ type testEnv struct {
 	sess   *SessionStore
 	srv    *httptest.Server
 	cfg    *Config
+	log    *safeBuf
 }
 
 func newEnv(t *testing.T, specs []string, tweak func(*Config)) *testEnv {
@@ -193,7 +213,8 @@ func newEnv(t *testing.T, specs []string, tweak func(*Config)) *testEnv {
 	if tweak != nil {
 		tweak(cfg)
 	}
-	lg := log.New(io.Discard, "", 0)
+	lb := &safeBuf{}
+	lg := log.New(lb, "", 0)
 	pool := NewPool(backends, PoolOpts{
 		Poll:          20 * time.Millisecond,
 		HealthTimeout: cfg.HealthTimeout,
@@ -204,7 +225,7 @@ func newEnv(t *testing.T, specs []string, tweak func(*Config)) *testEnv {
 	r := NewRouter(pool, sess, cfg, lg)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
-	return &testEnv{t: t, router: r, pool: pool, sess: sess, srv: srv, cfg: cfg}
+	return &testEnv{t: t, router: r, pool: pool, sess: sess, srv: srv, cfg: cfg, log: lb}
 }
 
 func (e *testEnv) addr() string { return e.srv.Listener.Addr().String() }
@@ -252,6 +273,13 @@ func get(path string) *http.Request { return clientReq(http.MethodGet, path, nil
 
 func withSession(r *http.Request, id string) *http.Request {
 	r.Header.Set("X-Session-Id", id)
+	return r
+}
+
+// withKey presents rooter's own front-door credential the way an OpenAI client
+// does.
+func withKey(r *http.Request, key string) *http.Request {
+	r.Header.Set("Authorization", "Bearer "+key)
 	return r
 }
 
@@ -1223,5 +1251,263 @@ func TestSpillAfterMovesASessionOffABusyBackend(t *testing.T) {
 	}
 	if name, ok := e.sess.Get(BindKey("h:spillme", "model-x")); !ok || name != "b" {
 		t.Errorf("session binding after spilling: %q ok=%v, want b", name, ok)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// front-door API key
+// ---------------------------------------------------------------------------
+
+func TestAPIKeyRequiredOnTheFrontDoor(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, func(c *Config) { c.APIKeys = []string{"Password1"} })
+
+	// Nothing presented: refused, and the backend never hears about it.
+	res, body := e.do(withSession(postJSON("/v1/chat/completions", chatBody("s", "hi")), "nokey"))
+	if res.StatusCode != 401 {
+		t.Fatalf("no credential -> %d %s, want 401", res.StatusCode, body)
+	}
+	if !strings.Contains(body, "authentication_error") {
+		t.Errorf("401 body is not OpenAI-shaped: %s", body)
+	}
+	if got := res.Header.Get("WWW-Authenticate"); !strings.Contains(got, "Bearer") {
+		t.Errorf("WWW-Authenticate = %q", got)
+	}
+	if n := a.genCounts(); n != 0 {
+		t.Errorf("denied request still reached the backend (%d)", n)
+	}
+
+	// Every spelling of the credential that a real client uses gets through.
+	for _, tt := range []struct {
+		name string
+		set  func(*http.Request)
+		want int
+	}{
+		{"bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer Password1") }, 200},
+		{"lowercase scheme", func(r *http.Request) { r.Header.Set("Authorization", "bearer Password1") }, 200},
+		{"bare authorization", func(r *http.Request) { r.Header.Set("Authorization", "Password1") }, 200},
+		{"x-api-key", func(r *http.Request) { r.Header.Set("X-Api-Key", "Password1") }, 200},
+		{"wrong key", func(r *http.Request) { r.Header.Set("Authorization", "Bearer hunter2") }, 401},
+		{"empty bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer ") }, 401},
+		{"other bearer", func(r *http.Request) { r.Header.Set("Authorization", "Bearer Password12") }, 401},
+		{"key in x-api-key, wrong", func(r *http.Request) { r.Header.Set("X-Api-Key", "Password2") }, 401},
+	} {
+		req := postJSON("/v1/chat/completions", chatBody("s", tt.name))
+		req.Header.Set("X-Session-Id", tt.name)
+		tt.set(req)
+		res, body = e.do(req)
+		if res.StatusCode != tt.want {
+			t.Errorf("%s -> %d %s, want %d", tt.name, res.StatusCode, body, tt.want)
+		}
+	}
+
+	// The requests that got through: bearer, lowercase, bare, x-api-key.
+	if n := a.genCounts(); n != 4 {
+		t.Errorf("backend got %d generations, want 4", n)
+	}
+}
+
+func TestMoreThanOneAPIKey(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	// Repeatable -api-key: one per person or device, so a leaked one can be
+	// dropped without locking everybody else out.
+	e := newEnv(t, []string{"a=" + a.url()}, func(c *Config) { c.APIKeys = []string{"Password1", " Password2 ", ""} })
+	for _, key := range []string{"Password1", "Password2"} {
+		res, body := e.do(withKey(withSession(postJSON("/v1/chat/completions", chatBody("s", key)), key), key))
+		if res.StatusCode != 200 {
+			t.Errorf("key %q -> %d %s", key, res.StatusCode, body)
+		}
+	}
+	res, body := e.do(withKey(withSession(postJSON("/v1/chat/completions", chatBody("s", "x")), "x"), "Password3"))
+	if res.StatusCode != 401 {
+		t.Errorf("unlisted key -> %d %s, want 401", res.StatusCode, body)
+	}
+}
+
+func TestAPIKeyDoesNotLeakUpstream(t *testing.T) {
+	// A backend with no token of its own must not inherit the client's rooter
+	// key: rooter's credential is rooter's business.
+	open := newFake(t, "open", "test-model", "")
+	e := newEnv(t, []string{"open=" + open.url()}, func(c *Config) { c.APIKeys = []string{"Password1"} })
+	res, body := e.do(withKey(withSession(postJSON("/v1/chat/completions", chatBody("s", "hi")), "leak"), "Password1"))
+	if res.StatusCode != 200 {
+		t.Fatalf("status %d %s", res.StatusCode, body)
+	}
+	if got := open.lastHeader().Get("Authorization"); got != "" {
+		t.Errorf("backend saw Authorization %q, want the client credential consumed", got)
+	}
+	if got := open.lastHeader().Get("X-Api-Key"); got != "" {
+		t.Errorf("backend saw x-api-key %q", got)
+	}
+
+	// A backend with a token still gets that token, not the caller's key.
+	back := newFake(t, "back", "test-model", "StrataToken")
+	e2 := newEnv(t, []string{"back=" + back.url() + ",token=StrataToken"}, func(c *Config) { c.APIKeys = []string{"Password1"} })
+	req := withKey(withSession(postJSON("/v1/chat/completions", chatBody("s", "hi")), "swap"), "Password1")
+	req.Header.Set("X-Api-Key", "Password1")
+	res, body = e2.do(req)
+	if res.StatusCode != 200 {
+		t.Fatalf("status %d %s", res.StatusCode, body)
+	}
+	if got := back.lastHeader().Get("Authorization"); got != "Bearer StrataToken" {
+		t.Errorf("backend Authorization = %q, want the backend token", got)
+	}
+	if got := back.lastHeader().Get("X-Api-Key"); got != "" {
+		t.Errorf("backend saw x-api-key %q", got)
+	}
+}
+
+func TestHealthProbesStayOpenWhenAuthIsOn(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, func(c *Config) { c.APIKeys = []string{"Password1"} })
+
+	// kubelet sends no credential, so the probes have to answer without one.
+	for _, path := range []string{"/rooter/healthz", "/rooter/health"} {
+		res, body := e.do(get(path))
+		if res.StatusCode != 200 {
+			t.Errorf("%s -> %d %s, want 200 unauthenticated", path, res.StatusCode, body)
+		}
+	}
+	// Everything else, including rooter's own debug endpoints, needs the key. A
+	// public /rooter/sessions would hand out conversation ids, and /rooter/forget
+	// would let a stranger shred every warm cache.
+	for _, path := range []string{"/rooter", "/rooter/stats", "/rooter/backends", "/rooter/sessions", "/rooter/metrics", "/rooter/forget?key=*", "/v1/models", "/v1/chat/completions"} {
+		// A *http.Request is single use, so build one per attempt.
+		makeReq := func() *http.Request {
+			if strings.HasPrefix(path, "/v1/chat") {
+				return postJSON(path, chatBody("s", "hi"))
+			}
+			return get(path)
+		}
+		res, body := e.do(makeReq())
+		if res.StatusCode != 401 {
+			t.Errorf("%s -> %d %s, want 401 without a key", path, res.StatusCode, body)
+		}
+		res, body = e.do(withKey(makeReq(), "Password1"))
+		if res.StatusCode == 401 {
+			t.Errorf("%s -> 401 with the key: %s", path, body)
+		}
+	}
+}
+
+func TestPublicPathIsConfigurable(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, func(c *Config) {
+		c.APIKeys = []string{"Password1"}
+		c.PublicPaths = []string{"/rooter/healthz", "/health"}
+	})
+	// /health is not a rooter path, so it is proxied - but it is now keyless, which
+	// is what an outside uptime check needs.
+	res, body := e.do(get("/health"))
+	if res.StatusCode != 200 {
+		t.Fatalf("public path -> %d %s", res.StatusCode, body)
+	}
+	if p := a.lastPath(); p != "/health" {
+		t.Errorf("backend path = %q", p)
+	}
+	for _, path := range []string{"/rooter/healthz", "/v1/models"} {
+		want := 200
+		if path != "/rooter/healthz" {
+			want = 401
+		}
+		if res, body := e.do(get(path)); res.StatusCode != want {
+			t.Errorf("%s -> %d %s, want %d", path, res.StatusCode, body, want)
+		}
+	}
+}
+
+func TestDenialsShowUpInStatsAndMetrics(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, func(c *Config) { c.APIKeys = []string{"Password1"} })
+	for i := 0; i < 3; i++ {
+		e.do(withSession(postJSON("/v1/chat/completions", chatBody("s", "nope")), "denied"))
+	}
+	e.do(withKey(withSession(postJSON("/v1/chat/completions", chatBody("s", "ok")), "allowed"), "Password1"))
+
+	stats := e.router.Stats()
+	if stats["denied"].(int64) != 3 {
+		t.Errorf("denied = %v, want 3", stats["denied"])
+	}
+	if stats["auth"] != true {
+		t.Errorf("auth = %v, want true", stats["auth"])
+	}
+	if stats["generations"].(int64) != 1 {
+		t.Errorf("generations = %v, want 1 (a 401 does not take a slot)", stats["generations"])
+	}
+	res, body := e.do(withKey(get("/rooter/metrics"), "Password1"))
+	if res.StatusCode != 200 {
+		t.Fatalf("metrics -> %d %s", res.StatusCode, body)
+	}
+	for _, want := range []string{"rooter_denied_total 3", "rooter_auth_required 1", "rooter_generation_requests_total 1"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestDenialsAreNotAWallOfLogLines(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, func(c *Config) { c.APIKeys = []string{"Password1"} })
+
+	// A fake clock, because the point of the window is that it is long.
+	base := time.Now()
+	clock := time.Duration(0)
+	e.router.now = func() time.Time { return base.Add(clock) }
+
+	deny := func() {
+		e.do(withSession(postJSON("/v1/chat/completions", chatBody("s", "scan")), "scan"))
+	}
+	for i := 0; i < 5; i++ {
+		deny()
+	}
+	logged := e.log.String()
+	if n := strings.Count(logged, "401 POST /v1/chat/completions"); n != 1 {
+		t.Fatalf("5 denials from one client produced %d log lines, want 1:\n%s", n, logged)
+	}
+	if strings.Contains(logged, "more from this client") {
+		t.Errorf("the first line cannot summarise denials that have not happened yet:\n%s", logged)
+	}
+
+	// Inside the window they stay silent; the next line past it accounts for them,
+	// so a scan burst costs one line and nothing is hidden from the log.
+	clock = denyLogInterval
+	deny()
+	logged = e.log.String()
+	if n := strings.Count(logged, "401 POST /v1/chat/completions"); n != 2 {
+		t.Fatalf("denial past the window -> %d lines, want 2:\n%s", n, logged)
+	}
+	if !strings.Contains(logged, "+4 more from this client") {
+		t.Errorf("suppressed denials were not summarised:\n%s", logged)
+	}
+	if got := e.router.Stats()["denied"].(int64); got != 6 {
+		t.Errorf("denied = %d, want every attempt counted even when the log is quiet", got)
+	}
+}
+
+func TestOpenFrontDoorStillWorksAndSaysSo(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, nil)
+	res, body := e.do(withKey(withSession(postJSON("/v1/chat/completions", chatBody("s", "hi")), "noauth"), "anything"))
+	if res.StatusCode != 200 {
+		t.Fatalf("without -api-key any credential should pass: %d %s", res.StatusCode, body)
+	}
+	if stats := e.router.Stats(); stats["auth"] != false {
+		t.Errorf("auth = %v, want false", stats["auth"])
+	}
+}
+
+func TestListenIsLoopback(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:8089":     true,
+		"localhost:8089":     true,
+		"[::1]:8089":         true,
+		":8089":              false,
+		"0.0.0.0:8089":       false,
+		"[::]:8089":          false,
+		"192.168.11.128:808": false,
+	} {
+		if got := listenIsLoopback(addr); got != want {
+			t.Errorf("listenIsLoopback(%q) = %v, want %v", addr, got, want)
+		}
 	}
 }

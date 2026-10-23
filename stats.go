@@ -65,6 +65,12 @@ func (r *Router) adminIndex(w http.ResponseWriter) {
 	if r.cfg.SpillAfter > 0 {
 		fmt.Fprintf(w, "spill after %s waiting on a busy sticky backend\n", r.cfg.SpillAfter)
 	}
+	if r.auth.enabled() {
+		fmt.Fprintf(w, "\napi key required on the front door (%d key(s), %s reachable without one)\n",
+			r.auth.keyCount(), strings.Join(r.cfg.PublicPaths, " "))
+	} else {
+		fmt.Fprintf(w, "\nno api key set - anyone who can reach this address can spend these backends\n")
+	}
 	fmt.Fprintf(w, "\nendpoints: /rooter/stats /rooter/metrics /rooter/backends /rooter/sessions /rooter/forget?key=K\n")
 }
 
@@ -72,23 +78,27 @@ func (r *Router) Stats() map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	status := map[string]int64{}
-	var tot int64
 	for code, n := range r.byStatus {
 		status[fmt.Sprint(code)] = n
-		tot += n
 	}
+	// avgWait is about generations. waitTotal only ever accumulates for a request
+	// that had to win a slot, so dividing it by every request (metadata reads,
+	// /rooter/*, 401s) would make a busy router look instant.
 	avg := time.Duration(0)
-	if tot > 0 {
-		avg = r.waitTotal / time.Duration(tot)
+	if r.slotted > 0 {
+		avg = r.waitTotal / time.Duration(r.slotted)
 	}
 	s := map[string]any{
-		"uptime":   time.Since(r.start).Round(time.Second).String(),
-		"requests": r.total,
-		"inflight": r.inflight,
-		"queued":   r.waiting,
-		"rejected": r.rejected,
-		"avgWait":  avg.String(),
-		"status":   status,
+		"uptime":      time.Since(r.start).Round(time.Second).String(),
+		"requests":    r.total,
+		"generations": r.slotted,
+		"inflight":    r.inflight,
+		"queued":      r.waiting,
+		"rejected":    r.rejected,
+		"denied":      r.denied,
+		"avgWait":     avg.String(),
+		"auth":        r.auth.enabled(),
+		"status":      status,
 	}
 	s["backends"] = r.pool.Stats()
 	s["slots"] = r.pool.SlotSummary()
@@ -148,13 +158,19 @@ func (r *Router) prometheus(w http.ResponseWriter) {
 	}
 	e("rooter_requests_total", "Requests received by rooter", "counter")
 	fmt.Fprintf(w, "rooter_requests_total %d\n", r.snapshotTotal())
+	e("rooter_generation_requests_total", "Requests that had to win a backend slot", "counter")
+	fmt.Fprintf(w, "rooter_generation_requests_total %d\n", r.snapshotSlotted())
+	e("rooter_auth_required", "Whether an -api-key guards the front door", "gauge")
+	fmt.Fprintf(w, "rooter_auth_required %d\n", boolGauge(r.auth.enabled()))
 	e("rooter_inflight", "Requests currently being proxied", "gauge")
 	e("rooter_queued", "Requests blocked waiting for a free slot", "gauge")
 	e("rooter_rejected_total", "Requests rejected because nothing was free", "counter")
+	e("rooter_denied_total", "Requests rejected by the front-door API key check", "counter")
 	e("rooter_wait_seconds_total", "Time spent waiting for slots", "counter")
 	e("rooter_sessions", "Tracked sessions", "gauge")
 	st := r.Stats()
 	fmt.Fprintf(w, "rooter_inflight %v\nrooter_queued %v\nrooter_rejected_total %v\n", st["inflight"], st["queued"], st["rejected"])
+	fmt.Fprintf(w, "rooter_denied_total %v\n", st["denied"])
 	fmt.Fprintf(w, "rooter_sessions %v\n", st["sessions_sessions"])
 	fmt.Fprintf(w, "rooter_wait_seconds_total %v\n", r.snapshotWait().Seconds())
 	e("rooter_backend_slots_busy", "Busy concurrency slots per backend", "gauge")
@@ -180,6 +196,19 @@ func (r *Router) snapshotTotal() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.total
+}
+
+func (r *Router) snapshotSlotted() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.slotted
+}
+
+func boolGauge(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func (r *Router) snapshotWait() time.Duration {

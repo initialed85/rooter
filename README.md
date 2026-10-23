@@ -6,8 +6,13 @@ A play on the word "router"...
 local `llama.cpp`-style servers and routes agent traffic between them. It is
 transparent: after it has decided *which* backend a request belongs on, it
 copies your request bytes to that backend and copies the response straight back,
-including SSE token streams. It does not rewrite messages, does not touch the
-sampling parameters, and does not need an API key of its own.
+including SSE token streams. It does not rewrite messages and does not touch the
+sampling parameters.
+
+It can guard its own front door with `-api-key`, which is what lets it sit on a
+routable address instead of `127.0.0.1`. That key is rooter's credential only: it
+is checked here and consumed here, and the backends get the tokens configured on
+their `-backend` specs. See [Front-door API key](#front-door-api-key).
 
 The point is **session stickiness for prefix caching**. A long agent session
 sends the same system prompt, the same tool definitions and a growing
@@ -58,6 +63,10 @@ that have free capacity.
 - **Retries** — if a backend dies *before* sending a single response byte, the
   request is replayed onto another one. Once bytes have reached the client it
   cannot retry, so it lets the failure through.
+- **Front-door auth is optional** — with `-api-key`, every request must present
+  that key or it is a `401` before a backend is chosen, a slot is taken or a body
+  is read. Without it rooter is open to whoever can reach the socket. See
+  [Front-door API key](#front-door-api-key).
 - **Cheap reads don't take slots** — `GET`s and a few suffixes (`/models`,
   `/health`, `/tokenize`, `/detokenize`, `/apply-template`, `/props`,
   `/version`, `/metrics`; see `-free-path`) pass through without occupying a
@@ -105,13 +114,16 @@ go test -race ./...
 ```shell
 ./rooter \
     -listen :8089 \
+    -api-key Password1 \
     -backend 'strata=http://192.168.11.128:8088/v1,token=Password1,concurrency=4' \
     -backend 'sushi=http://192.168.137.111:8088/v1,token=Password1,concurrency=1'
 ```
 
 A `-backend` flag per upstream. Spec keys: `name`, `url` (or `base`/`endpoint`),
 `token` (or `api-key`), `concurrency` (or `slots`). The name defaults to the
-URL's hostname, so `-backend http://host:8088/v1` is legal. `token` is sent as
+URL's hostname, so `-backend http://host:8088/v1` is legal. `api-key` *inside* a
+backend spec is that upstream's token; the standalone `-api-key` flag guards
+rooter's own front door. Two different strings, two different directions. `token` is sent as
 `Authorization: Bearer <token>`, replacing whatever the client sent; leave it
 out and the client's `Authorization` passes through untouched. Escape `,` and
 `=` in a value as `\,` and `\=`.
@@ -130,16 +142,64 @@ Useful flags:
 | `-meta-model` | `auto`, `default` built in | extra names that mean "whichever backend is freest" |
 | `-spill-after` | `0` | after waiting this long on a busy sticky backend, take another eligible one (0 = never) |
 | `-scan-window` / `-max-body` | `1MiB` / `64MiB` | how much of a body is buffered for classification and replay |
+| `-api-key` | none | key clients must present; repeat for more than one; empty = open front door |
+| `-public-path` | `/rooter/healthz`, `/rooter/health` | path suffix reachable without `-api-key` |
 | `-xff` | off | let `X-Forwarded-For` be added upstream |
 | `-verbose` / `-quiet` | | log routing detail / log only failures |
 
+### Front-door API key
+
+`-api-key Password1` (repeatable, one accepted key per flag) makes rooter answer
+`401` to anything that cannot present it:
+
+```shell
+curl -s localhost:8089/v1/chat/completions -d '{"model":"auto","messages":[]}'
+# {"error":{"type":"authentication_error","code":"invalid_api_key","message":"missing API key: ..."}}
+
+curl -s localhost:8089/v1/models -H 'Authorization: Bearer Password1'
+curl -s localhost:8089/rooter/stats -H 'x-api-key: Password1'
+```
+
+The key is accepted as `Authorization: Bearer <key>`, a bare `Authorization:
+<key>`, or `x-api-key: <key>` — every spelling an OpenAI-ish client uses in
+practice. Comparison is constant time, so a scanner cannot walk the prefix of a
+valid key one character at a time.
+
+What it does and does not do:
+
+- **It is a gate, not routing.** The check runs first, before a slot is taken or
+  the body is read, so a rejected request costs nothing but a syscall. Denials are
+  counted in `/rooter/stats` (`denied`) and `rooter_denied_total`, and each client
+  gets one log line per 30s with the rest summarised, so an internet-facing port
+  being scanned cannot bury the routing log that is the reason the log exists.
+- **The credential stops at rooter.** With `-api-key` set, the client's
+  `Authorization`/`x-api-key` is deleted before proxying; the backend then gets
+  whatever `token=` its spec carries, or nothing if it has no token. A caller's
+  rooter key never reaches a box it has no business on.
+- **Health probes stay open.** `-public-path` (default `/rooter/healthz`,
+  `/rooter/health`) needs no key, because kubelet presents nothing and a probe
+  that 401s would restart the pod and wipe the session table. It matches suffixes
+  inside the `/rooter` namespace by default, which is why the defaults are spelled
+  out in full and not as bare `/health`. Everything else — `/v1/*`,
+  `/rooter/sessions` (every conversation id on the network), `/rooter/forget` (a
+  way to shred every warm cache) — needs the key.
+- **Repeat it for more than one accepted key**, one per person or device, so a
+  leaked one can be dropped without locking everybody else out. Roster, rotation
+  and per-user accounting are not rooter's job; if you want them, put something in
+  front that does them and leave this as the coarse gate.
+
+With no `-api-key` the front door is open, and rooter says so at startup: an
+address that is not loopback logs a `WARNING`. That is fine on a LAN you own and
+is the historical default; it is not fine on a port somebody else can route to.
+
 ### Looking at it
 
-Everything under `/rooter/` belongs to rooter; every other path is proxied.
+Everything under `/rooter/` belongs to rooter; every other path is proxied. If
+`-api-key` is set, pass it on these too (except the health probes).
 
-- `GET /rooter` — index
-- `GET /rooter/stats` — JSON: per-backend health/busy/slots/models, queue and
-  status counters, session hit/miss/rebind totals
+- `GET /rooter` — index, including whether the front door is keyed
+- `GET /rooter/stats` — JSON: per-backend health/busy/slots/models, queue,
+  denial and status counters, session hit/miss/rebind totals
 - `GET /rooter/backends`, `GET /rooter/sessions` — the same, split up
 - `GET /rooter/metrics` — Prometheus gauges and counters
 - `GET /rooter/forget?key=p:abc123` — drop a session and every per-model binding
@@ -188,6 +248,11 @@ pin to one box. Note the id `auto` is not a real model - llama.cpp will answer i
 with the weights it has loaded, which is the whole point, and Pi cannot tell from
 the response which box replied.
 
+`apiKey` is the **rooter** key, i.e. the value of rooter's `-api-key`. It is not
+the backend token and it is not the same string just because both happen to be
+`Password1` in this file: change one and the other keeps working, and if they
+ disagree you get a `401` from rooter before anything reaches llama.cpp.
+
 `api` can be set per model as well as per provider. Both backends answer
 `/v1/chat/completions` and `/v1/responses` (rooter proxies either, and keys
 sessions from both shapes), so each model here carries the API it is used to when
@@ -202,5 +267,7 @@ Pi says nothing. It is still worth setting, because an explicit session id keeps
 conversation pinned even when you compact or branch it, whereas the prefix hash
 follows the transcript.
 
-Mind that rooter has **no auth** of its own: bind it to `127.0.0.1` (or a
-cluster-internal address) and keep the backend tokens out of the listener.
+Without `-api-key`, rooter has no auth of its own and must be bound to
+`127.0.0.1` or a network you trust. With it, rooter can be published: keep the
+backend tokens in a Secret, keep the front-door key in a Secret, and treat
+`/rooter/healthz` as the only thing a stranger is allowed to see.

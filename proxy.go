@@ -23,16 +23,21 @@ type Router struct {
 	sessions *SessionStore
 	cfg      *Config
 	log      *log.Logger
+	auth     *authGuard
 	proxies  map[string]*httputil.ReverseProxy
 	start    time.Time
 
 	mu        sync.Mutex
 	total     int64
+	slotted   int64 // requests that had to win a slot: the honest avgWait denominator
 	inflight  int64
 	waiting   int64
 	rejected  int64
+	denied    int64
 	waitTotal time.Duration
 	byStatus  map[int]int64
+	denyNote  map[string]*denyNote
+	now       func() time.Time // a test seam for the denial log window
 }
 
 func NewRouter(p *Pool, s *SessionStore, cfg *Config, logger *log.Logger) *Router {
@@ -41,9 +46,12 @@ func NewRouter(p *Pool, s *SessionStore, cfg *Config, logger *log.Logger) *Route
 		sessions: s,
 		cfg:      cfg,
 		log:      logger,
+		auth:     newAuthGuard(cfg),
 		proxies:  map[string]*httputil.ReverseProxy{},
 		start:    time.Now(),
 		byStatus: map[int]int64{},
+		denyNote: map[string]*denyNote{},
+		now:      time.Now,
 	}
 	var tr http.RoundTripper = &http.Transport{
 		// Never transparently negotiate gzip: it would buffer and inflate
@@ -144,14 +152,25 @@ func needsSlot(method, path string, free []string) bool {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if isRooterPath(req.URL.Path) {
-		r.admin(w, req)
-		return
-	}
 	start := time.Now()
 	r.mu.Lock()
 	r.total++
 	r.mu.Unlock()
+
+	// Front-door auth runs before anything else, including rooter's own
+	// endpoints: /rooter/sessions and /rooter/forget are worth scraping, and on a
+	// routable address they should not be readable by whoever finds the port.
+	if !r.auth.ok(req) {
+		r.denial(w, req)
+		return
+	}
+	// The client's rooter credential stops here; backends get their own tokens.
+	r.auth.consume(req)
+
+	if isRooterPath(req.URL.Path) {
+		r.admin(w, req)
+		return
+	}
 
 	// One pass: headers first, then the buffered body prefix. The body is always
 	// scanned when present, because it also carries the requested model, which
@@ -194,6 +213,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if slot {
 		r.mu.Lock()
 		r.waiting++
+		r.slotted++
 		r.mu.Unlock()
 	}
 	held, out, err := r.pool.Acquire(ctx, opts)
@@ -452,6 +472,18 @@ func statusForErr(err error) int {
 	default:
 		return http.StatusGatewayTimeout
 	}
+}
+
+// denial answers a request that failed rooter's own front-door check. It takes no
+// slot, touches no backend, and never says anything about which key was expected.
+func (r *Router) denial(w http.ResponseWriter, req *http.Request) {
+	have, _ := presented(req)
+	r.mu.Lock()
+	r.denied++
+	r.byStatus[http.StatusUnauthorized]++
+	r.mu.Unlock()
+	r.logDenial(req)
+	authDenied(w, have == "")
 }
 
 func (r *Router) noBackend(w http.ResponseWriter, req *http.Request, info requestInfo, err error, out Outcome, start time.Time) {
