@@ -1,0 +1,93 @@
+# Build, publish, and deploy rooter.
+#
+# Shape (same contract as bench-chroma-rush, which is the reference pipeline):
+#   1. `test` is the gate: fmt, vet, tests, in a plain `golang` pod.
+#   2. `compile-binary` writes `tmp/rooter` into the workflow's workspace PVC, which is shared by every
+#      step of this file (the compiler prefixes the volume with a per-workflow ULID,
+#      `pipeline/frontend/yaml/compiler/compiler.go:137`, so steps in *different files* share nothing).
+#      That mirrors `build-tag-and-push.sh`, which compiles on the host so the image ships the exact
+#      bytes the tests just ran against, and keeps the runtime image toolchain-free.
+#   3. `build-and-push` is a `docker:cli` pod: it has no docker socket of its own, so `DOCKER_HOST`
+#      points at one CI node's dockerd (`docker-beefcake-ci-1` Service -> 192.168.1.213:2375, published
+#      by home-ops `clusters/dev/applications/woodpecker/files/enable-docker-tcp.sh`). Pinning one node
+#      per repo is what keeps its layer cache warm; the ubuntu base comes back `CACHED`.
+#   4. `deploy-home-ops` is the plugin (`initialed85/wp-kustomize-deploy`, source in home-ops
+#      `ci/woodpecker/plugins/kustomize-deploy/`): it stamps this build's sha into
+#      `clusters/dev/applications/rooter/kustomization.yaml` and pushes, so Argo CD rolls the
+#      Deployment. Git is the deploy record and `git revert` is the rollback.
+#
+# Tags: `:$CI_COMMIT_SHA` is the immutable one (and the one the manifest pins); `:latest` stays as the
+# convenience tag for `docker run` and for any host that still pulls it by hand. rooter declares no
+# version, so there is no semver tag to publish.
+#
+# Credentials are native Kubernetes Secrets in the `woodpecker` namespace, mapped to env by
+# `backend_options.kubernetes.secrets` (needs `WOODPECKER_BACKEND_K8S_ALLOW_NATIVE_SECRETS=true`, which
+# the agent has): `dockerhub` (user + PAT) and `home-ops-deploy-key` (ed25519 deploy key, write access
+# to the home-ops repo only). No secret text lives in this repository.
+steps:
+  - name: test
+    image: docker.io/library/golang:1.27
+    commands:
+      - go version
+      - go mod download
+      - test -z "$(gofmt -l .)" || { gofmt -l .; echo "FATAL gofmt - commit the output of gofmt -w ."; exit 1; }
+      - go vet ./...
+      - go test -v -count=1 ./...
+
+  - name: compile-binary
+    image: docker.io/library/golang:1.27
+    depends_on: [test]
+    commands:
+      - mkdir -p tmp
+      - env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o ./tmp/rooter .
+      - ls -l tmp/rooter
+      - ./tmp/rooter -help 2>&1 | head -5 || true
+
+  - name: build-and-push
+    image: docker.io/library/docker:cli
+    privileged: true
+    depends_on: [compile-binary]
+    environment:
+      DOCKER_HOST: tcp://docker-beefcake-ci-1:2375
+      IMAGE: docker.io/initialed85/rooter
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: dockerhub
+            key: username
+            target:
+              env: DOCKERHUB_USER
+          - name: dockerhub
+            key: token
+            target:
+              env: DOCKERHUB_TOKEN
+    commands:
+      - docker info --format 'daemon={{.Name}} images_before={{.Images}}'
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+      - docker build --pull --progress=plain --platform=linux/amd64 -t "$IMAGE:$CI_COMMIT_SHA" -t "$IMAGE:latest" -f Dockerfile .
+      - docker push "$IMAGE:$CI_COMMIT_SHA"
+      - docker push "$IMAGE:latest"
+      - docker inspect --format 'digests={{.RepoDigests}}' "$IMAGE:$CI_COMMIT_SHA"
+      - docker system df
+
+  - name: deploy-home-ops
+    image: docker.io/initialed85/wp-kustomize-deploy:latest
+    depends_on: [build-and-push]
+    settings:
+      image: docker.io/initialed85/rooter
+      dir: clusters/dev/applications/rooter
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: home-ops-deploy-key
+            key: id_ed25519
+            target:
+              env: PLUGIN_DEPLOY_KEY
+          - name: home-ops-deploy-key
+            key: known_hosts
+            target:
+              env: PLUGIN_KNOWN_HOSTS
+
+when:
+  - event: push
+    branch: master
