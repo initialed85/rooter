@@ -213,8 +213,8 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied. If
   is bounded (`-event-ring`, default 2048) and drops the oldest half at a time, and
   the response says so: `stale: true` plus `dropped_total` is how you tell "nothing
   new" from "you missed it". Ids are `<boot id>/<seq>`, so they cannot be re-issued
-  across a restart - which is exactly when a client retries. Each record carries
-  `ttft_ms` and, on a stream, `first_content_ms`; they are different quantities and
+  across a restart - which is exactly when a client retries. On a stream each record
+  carries both `ttft_ms` and `first_content_ms`; they are different quantities and
   both are kept, for the reason in the measurement note below.
 - `GET /rooter/forget?key=p:abc123` — drop a session and every per-model binding
   it holds; a bare id works too (`h:`/`p:` are tried for you), and `key=*` clears
@@ -265,6 +265,13 @@ has already begun streaming. Anything graphing `ttft_ms` from `/rooter/events` i
 therefore graphing *how soon the runner started replying*, which is a useful saturation
 signal and a misleading responsiveness one. A client that wants time-to-first-word on
 a stream has to measure it itself, against the first chunk carrying text.
+
+Rooter measures it, so a client does not have to: `first_content_ms` on a streamed
+record is the first chunk carrying words, timed from the same instant as `ttft_ms`, so
+subtracting one from the other gives the runner's internal queue. "Words" means
+`content`, `reasoning_content` or `text` with a non-empty string value - a thinking
+model's first twenty deltas are `reasoning_content`, and treating only `content` as
+speech reports the end of the thinking as the first word.
 
 `-no-meta` turns all of this off; `-meta-tail 0` keeps the headers and stops rooter
 reading response bodies at all.
