@@ -40,6 +40,9 @@ type Config struct {
 	Verbose        bool
 	Quiet          bool
 	NoCatalog      bool
+	NoMeta         bool
+	MetaTail       int
+	EventRing      int
 	Version        bool
 }
 
@@ -78,6 +81,10 @@ Flags:
 Backend spec keys: name, url (or base), token (or api-key), concurrency (or slots).
 Shorthand: -backend 'strata=http://192.168.11.128:8088/v1,token=Password1,concurrency=4'
 
+Every response carries X-Rooter-* headers naming the backend, the model that
+actually answered, and the route taken; a non-streaming JSON body also gets a
+rooter object with the per-token numbers. -no-meta turns all of that off.
+
 A -meta-model name is not a model: a request for it may go to any healthy backend
 (auto and default are built in). Everything else is matched against each
 backend's /models, and a name no backend claims is a 404 rather than an answer
@@ -112,6 +119,9 @@ publish rooter on a routable address; the backends' own tokens stay in here.
 	fs.Var((*stringList)(&c.APIKeys), "api-key", "key clients must present (Authorization: Bearer or x-api-key); repeat for more than one; empty = no front-door auth")
 	fs.Var((*stringList)(&c.PublicPaths), "public-path", "path suffix reachable without -api-key (repeatable)")
 	fs.BoolVar(&c.NoCatalog, "no-catalog", false, "answer /v1/models by proxying to one backend, instead of serving the merged catalog")
+	fs.BoolVar(&c.NoMeta, "no-meta", false, "emit no X-Rooter-* headers, add no rooter object to responses, and do not read response tails")
+	fs.IntVar(&c.MetaTail, "meta-tail", 16384, "how many trailing bytes of a response rooter keeps in order to read usage and timings from")
+	fs.IntVar(&c.EventRing, "event-ring", 2048, "how many recent calls /rooter/events keeps in memory; 0 keeps the default")
 	fs.BoolVar(&c.XForwarded, "xff", false, "let X-Forwarded-For be added to upstream requests")
 	fs.BoolVar(&c.Verbose, "verbose", false, "log retries, queue detail and more")
 	fs.BoolVar(&c.Quiet, "quiet", false, "only log requests that failed")

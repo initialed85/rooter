@@ -283,6 +283,21 @@ func withKey(r *http.Request, key string) *http.Request {
 	return r
 }
 
+// backendOf reads which fake answered. It deliberately does not compare the
+// whole body: rooter adds a "rooter" object to a JSON response, and a test that
+// byte-matched the upstream's reply would be asserting that rooter changed
+// nothing, which is no longer true on purpose.
+func backendOf(t *testing.T, body string) string {
+	t.Helper()
+	var d struct {
+		Backend string `json:"backend"`
+	}
+	if err := json.Unmarshal([]byte(body), &d); err != nil {
+		t.Fatalf("body is not the JSON a fake returns: %v\n%s", err, body)
+	}
+	return d.Backend
+}
+
 func chatBody(system, user string) string {
 	return fmt.Sprintf(`{"model":"test-model","messages":[{"role":"system","content":%q},{"role":"user","content":%q}]}`, system, user)
 }
@@ -607,8 +622,8 @@ func TestModelEligibility(t *testing.T) {
 		if res.StatusCode != 200 {
 			t.Fatalf("status %d %s", res.StatusCode, out)
 		}
-		if out != `{"backend":"b"}` {
-			t.Errorf("routed to the wrong backend: %s", out)
+		if got := backendOf(t, out); got != "b" {
+			t.Errorf("routed to the wrong backend: %s -> %q", out, got)
 		}
 	}
 	if n := a.genCounts(); n != 0 {
@@ -653,7 +668,7 @@ func TestStickyYieldsToModelEligibility(t *testing.T) {
 		if res.StatusCode != 200 {
 			t.Fatalf("turn %d (%s): %d %s", i, m, res.StatusCode, out)
 		}
-		if want := `{"backend":"` + owner[m] + `"}`; out != want {
+		if want := owner[m]; backendOf(t, out) != want {
 			t.Errorf("turn %d model %s -> %s, want %s", i, m, out, want)
 		}
 	}
@@ -685,7 +700,7 @@ func TestQuantTaggedAliasRoutesToItsBackend(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("quant-tagged alias: %d %s", res.StatusCode, out)
 	}
-	if out != `{"backend":"a"}` {
+	if got := backendOf(t, out); got != "a" {
 		t.Errorf("alias routed to %s, want a", out)
 	}
 	if n := b.genCounts(); n != 0 {
@@ -1136,7 +1151,7 @@ func TestResponsesPathSticksByPrefix(t *testing.T) {
 	if res1.StatusCode != 200 || res2.StatusCode != 200 {
 		t.Fatalf("statuses %d %d (%s %s)", res1.StatusCode, res2.StatusCode, out1, out2)
 	}
-	if out1 != out2 {
+	if backendOf(t, out1) != backendOf(t, out2) {
 		t.Errorf("turns of one responses conversation landed differently: %s vs %s", out1, out2)
 	}
 	if st := e.sess.Stats(); st["hits"].(int64) < 1 {

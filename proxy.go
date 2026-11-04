@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,12 @@ type Router struct {
 	auth     *authGuard
 	proxies  map[string]*httputil.ReverseProxy
 	start    time.Time
+	bootID   string // unique per process, so call ids survive a restart
+
+	// events and models are the per-call record and its aggregate. Both are
+	// internally locked, so they sit outside Router.mu.
+	events *eventRing
+	models *modelStats
 
 	mu        sync.Mutex
 	total     int64
@@ -35,6 +42,7 @@ type Router struct {
 	rejected  int64
 	denied    int64
 	aborted   int64 // client hung up before the response finished
+	seq       int64 // per-call id, monotonic within a process
 	waitTotal time.Duration
 	byStatus  map[int]int64
 	denyNote  map[string]*denyNote
@@ -53,6 +61,12 @@ func NewRouter(p *Pool, s *SessionStore, cfg *Config, logger *log.Logger) *Route
 		byStatus: map[int]int64{},
 		denyNote: map[string]*denyNote{},
 		now:      time.Now,
+		bootID:   newBootID(),
+		events:   newEventRing(cfg.EventRing),
+		models:   newModelStats(),
+	}
+	if !cfg.NoMeta && cfg.MetaTail <= 0 {
+		cfg.MetaTail = 16384
 	}
 	var tr http.RoundTripper = &http.Transport{
 		// Never transparently negotiate gzip: it would buffer and inflate
@@ -278,6 +292,20 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// exist before the call that can blow up.
 	var res attempt
 	aborted := false
+
+	// The record is built here, not in roundTrip, because most of it is known
+	// before the backend is even asked: the identity a client needs in order to
+	// render a footer while the tokens are still arriving.
+	rec := r.newCallRecord(req, info, r.nextID())
+	rec.Stream = streamRequested(body)
+	rec.Kind = routeKind(slot, out)
+	rec.WaitMs = float64(out.Waited) / float64(time.Millisecond)
+	if info.Resolved != "" {
+		rec.Model = info.Resolved // a backend-name alias: the client asked for the box
+	}
+	rw := &replyWriter{ResponseWriter: w, started: start, mayBuffer: !r.cfg.NoMeta,
+		maxTail: r.cfg.MetaTail, maxBuf: int(r.cfg.MaxBody)}
+
 	// Every way out of this function has to balance the increment above. It did
 	// not use to: when a client hangs up mid-response, ReverseProxy panics with
 	// http.ErrAbortHandler and net/http recovers that sentinel *silently*, so
@@ -286,26 +314,30 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// abandoned generation went missing from byStatus. Abandonment is also the
 	// one outcome that says something about answer quality, so it gets a counter
 	// of its own instead of disappearing.
+	//
+	// settle also releases a held JSON body, so it has to run on the panic path
+	// too: a client waiting on a response rooter decided to buffer would
+	// otherwise hang until the server timed it out.
 	defer func() {
 		if p := recover(); p != nil {
 			if p == http.ErrAbortHandler {
 				res = attempt{status: statusAborted, err: errAborted, wrote: true, ttfb: res.ttfb}
 				aborted = true
 			} else {
-				r.settle(w, req, &res, held, info, &out, start, slot, aborted)
+				r.settle(rw, req, &res, held, info, &out, start, slot, aborted, rec)
 				panic(p) // not ours to interpret; let net/http log it and drop the conn
 			}
 		}
-		r.settle(w, req, &res, held, info, &out, start, slot, aborted)
+		r.settle(rw, req, &res, held, info, &out, start, slot, aborted, rec)
 	}()
 
-	res = r.dispatch(ctx, w, req, &held, body, partial, info, &out, slot)
+	res = r.dispatch(ctx, rw, req, &held, body, partial, info, &out, slot, rec)
 }
 
 // settle closes the books on one proxied exchange. It runs on the normal path
 // and on the panic path, so it must not assume anything about how far dispatch
 // got. Returns the attempt through res so the caller sees the final status.
-func (r *Router) settle(w http.ResponseWriter, req *http.Request, res *attempt, b *Backend, info requestInfo, out *Outcome, start time.Time, slot, aborted bool) {
+func (r *Router) settle(w *replyWriter, req *http.Request, res *attempt, b *Backend, info requestInfo, out *Outcome, start time.Time, slot, aborted bool, rec *callRecord) {
 	if res.status == 0 && !aborted {
 		res.status = http.StatusBadGateway
 		if !res.wrote {
@@ -319,6 +351,10 @@ func (r *Router) settle(w http.ResponseWriter, req *http.Request, res *attempt, 
 		r.aborted++
 	}
 	r.mu.Unlock()
+
+	// Finish the record before releasing a held body, so the object the client
+	// sees is the same one rooter keeps.
+	r.finishRecord(w, rec, res, b, out, start, aborted)
 	r.logLine(req, b, info, *out, *res, start, slot)
 }
 
@@ -340,7 +376,7 @@ type attempt struct {
 
 // dispatch runs the request against *hold, retrying onto another backend when
 // the current one failed before a single response byte reached the client.
-func (r *Router) dispatch(ctx context.Context, w http.ResponseWriter, req *http.Request, hold **Backend, body []byte, partial bool, info requestInfo, out *Outcome, slot bool) attempt {
+func (r *Router) dispatch(ctx context.Context, w *replyWriter, req *http.Request, hold **Backend, body []byte, partial bool, info requestInfo, out *Outcome, slot bool, rec *callRecord) attempt {
 	maxAttempts := r.cfg.Retries + 1
 	if partial {
 		maxAttempts = 1 // body only partly buffered: it cannot be replayed
@@ -351,7 +387,9 @@ func (r *Router) dispatch(ctx context.Context, w http.ResponseWriter, req *http.
 	for {
 		b := *hold
 		tried[b.Name] = true
-		res = r.roundTrip(ctx, w, req, b, body, partial)
+		rec.Backend = b.Name
+		rec.BackendURL = b.Base.String()
+		res = r.roundTrip(ctx, w, req, b, body, partial, rec)
 		if res.err == nil || res.wrote {
 			return res
 		}
@@ -389,7 +427,15 @@ func (r *Router) dispatch(ctx context.Context, w http.ResponseWriter, req *http.
 	}
 }
 
-func (r *Router) roundTrip(ctx context.Context, w http.ResponseWriter, req *http.Request, b *Backend, body []byte, partial bool) attempt {
+func (r *Router) roundTrip(ctx context.Context, w *replyWriter, req *http.Request, b *Backend, body []byte, partial bool, rec *callRecord) attempt {
+	if !r.cfg.NoMeta {
+		// These are known before a byte moves, which is exactly why they are
+		// headers and not body fields: a client rendering a footer while the
+		// tokens are still arriving can have them now.
+		rec.Backend = b.Name
+		rec.BackendURL = b.Base.String()
+		setMetaHeaders(w.Header(), rec)
+	}
 	px, ok := r.proxies[b.Name]
 	if !ok {
 		return attempt{status: http.StatusBadGateway, err: fmt.Errorf("no proxy configured for backend %s", b.Name)}
@@ -412,31 +458,54 @@ func (r *Router) roundTrip(ctx context.Context, w http.ResponseWriter, req *http
 	if outreq.Header == nil {
 		outreq.Header = http.Header{}
 	}
-	rw := &replyWriter{ResponseWriter: w, started: time.Now()}
-	px.ServeHTTP(rw, outreq)
-	status := rw.status
-	if status == 0 && rw.err == nil {
+	// The writer is the per-request one, not a fresh wrapper per attempt: the
+	// buffering state and the tail have to survive a retry onto another backend,
+	// and double-wrapping would leave the outer writer believing it wrote nothing.
+	w.started = time.Now()
+	w.wrote = false
+	w.status = 0
+	w.tail = w.tail[:0]
+	w.buf = w.buf[:0]
+	w.buffering = false
+	px.ServeHTTP(w, outreq)
+	status := w.status
+	if status == 0 && w.err == nil {
 		status = http.StatusOK
 	}
 	if status == 0 {
 		// Nothing reached the client and the round trip blew up.
-		return attempt{status: 0, bytes: rw.bytes, err: rw.err, wrote: false, ttfb: rw.ttfb}
+		return attempt{status: 0, bytes: w.bytes, err: w.err, wrote: false, ttfb: w.ttfb}
 	}
-	return attempt{status: status, bytes: rw.bytes, err: rw.err, wrote: rw.wrote, ttfb: rw.ttfb}
+	return attempt{status: status, bytes: w.bytes, err: w.err, wrote: w.wrote, ttfb: w.ttfb}
 }
 
 // ---------------------------------------------------------------------------
 // response writer
 // ---------------------------------------------------------------------------
 
+// replyWriter is the one place rooter sees the response as the client sees it.
+//
+// It has to do three jobs at once, and the second one is why it is careful:
+// report the status and byte count, keep enough of the tail to read the
+// per-token numbers the runner puts in its last chunk, and - for a non-streaming
+// JSON body only - add rooter's own object to it. A stream is never held back
+// and never edited: those bytes are the user's tokens arriving, and buffering
+// them to be clever about metadata would be a terrible trade.
 type replyWriter struct {
 	http.ResponseWriter
-	wrote   bool
-	status  int
-	bytes   int64
-	err     error
-	ttfb    time.Duration
-	started time.Time
+	wrote     bool
+	status    int
+	bytes     int64
+	err       error
+	ttfb      time.Duration
+	started   time.Time
+	mayBuffer bool   // this request is one rooter may briefly hold a body for
+	buf       []byte // non-streaming JSON body, held so it can be extended
+	buffering bool   // currently holding the status and body together
+	hook      bodyHook
+	tail      []byte // bounded ring of the last bytes written, for timing parsing
+	maxTail   int
+	maxBuf    int
 }
 
 func (w *replyWriter) Header() http.Header { return w.ResponseWriter.Header() }
@@ -448,12 +517,54 @@ func (w *replyWriter) WriteHeader(code int) {
 	w.wrote = true
 	w.status = code
 	w.ttfb = time.Since(w.started)
+	// A 200 JSON body is one object the client cannot act on until it is whole,
+	// so it is safe to hold briefly and add a key to. Anything else - an error,
+	// a stream, a binary - is passed through untouched.
+	// rooter only holds a body when it has been told to add something to it, and
+	// that decision is made per request, not here.
+	if code == http.StatusOK && w.mayBuffer && w.maxBuf > 0 &&
+		strings.Contains(w.Header().Get("Content-Type"), "application/json") {
+		w.buffering = true
+		return
+	}
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// observe keeps the last bytes of what went to the client, without ever
+// allocating more than the ring.
+func (w *replyWriter) observe(p []byte) {
+	if w.maxTail <= 0 {
+		return
+	}
+	if len(w.tail) == 0 {
+		w.tail = make([]byte, 0, w.maxTail)
+	}
+	w.tail = append(w.tail, p...)
+	if over := len(w.tail) - w.maxTail; over > 0 {
+		w.tail = append(w.tail[:0], w.tail[over:]...)
+	}
 }
 
 func (w *replyWriter) Write(p []byte) (int, error) {
 	if !w.wrote {
 		w.WriteHeader(http.StatusOK)
+	}
+	w.observe(p)
+	if w.buffering {
+		if len(w.buf)+len(p) > w.maxBuf {
+			// Too big to hold. Give up on being clever; what has already been
+			// buffered goes out with the rest.
+			w.flushBuf()
+			n, err := w.ResponseWriter.Write(p)
+			w.bytes += int64(n)
+			if err != nil {
+				w.err = err
+			}
+			return n, err
+		}
+		w.buf = append(w.buf, p...)
+		w.bytes += int64(len(p))
+		return len(p), nil
 	}
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += int64(n)
@@ -463,7 +574,72 @@ func (w *replyWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// flushBuf writes the held body with the status that was held with it.
+//
+// Both the status and the length have to wait until here. Releasing the status
+// early would send a Content-Length the injected body no longer matches, and
+// net/http reacts to that by mangling the response rather than complaining -
+// which is a very bad failure mode to discover from a client that simply saw
+// nothing.
+func (w *replyWriter) flushBuf() {
+	if !w.buffering {
+		return
+	}
+	w.buffering = false
+	code := w.status
+	if code == 0 {
+		code = http.StatusOK
+	}
+	if len(w.buf) > 0 {
+		w.Header().Set("Content-Length", strconv.Itoa(len(w.buf)))
+	} else {
+		// Nothing arrived, so there is no length to promise. Dropping the
+		// upstream's header stops net/http declaring bytes it never gets.
+		w.Header().Del("Content-Length")
+	}
+	w.ResponseWriter.WriteHeader(code)
+	if len(w.buf) == 0 {
+		return
+	}
+	n, err := w.ResponseWriter.Write(w.buf)
+	if n > 0 {
+		w.bytes += int64(n) // an injected body is longer than the one already counted
+	}
+	if err != nil {
+		w.err = err
+	}
+	w.buf = w.buf[:0]
+}
+
+// finalize releases a held body and its status. It must run on every path,
+// including the one where the proxy panicked: a client waiting on a response
+// rooter decided to buffer would otherwise hang until the server timed it out.
+//
+// It is also where the injection happens, because that is the last moment the
+// bytes are still rooter's to change.
+func (w *replyWriter) finalize() {
+	if !w.buffering {
+		return
+	}
+	w.buf = w.hook(w.buf)
+	w.flushBuf()
+}
+
+// hook is given the complete upstream body and returns what goes to the client.
+// Set by finishRecord. It must not fail: returning nil drops the body, so the
+// default is identity.
+type bodyHook func([]byte) []byte
+
 func (w *replyWriter) Flush() {
+	// A flush commits the response header. While a body is being held that is
+	// exactly the wrong thing to do: ReverseProxy flushes after every chunk with
+	// FlushInterval -1, so honouring it here would write the status and the
+	// upstream's Content-Length before the injected body existed, and net/http
+	// would mangle the result rather than complain. A JSON response is not a
+	// stream; there is nothing the client is waiting to see mid-flush.
+	if w.buffering {
+		return
+	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -588,21 +764,26 @@ func (r *Router) noBackend(w http.ResponseWriter, req *http.Request, info reques
 	errJSON(w, code, msg)
 }
 
+// routeKind is why a call went where it went. It is one function so the log
+// line, the X-Rooter-Route header and the event record cannot drift apart.
+func routeKind(slot bool, out Outcome) string {
+	if !slot {
+		return "read"
+	}
+	if out.Rebound {
+		if out.Spilled {
+			return "spill" // waited too long on a busy sticky backend
+		}
+		return "rebind"
+	}
+	return "gen"
+}
+
 func (r *Router) logLine(req *http.Request, b *Backend, info requestInfo, out Outcome, res attempt, start time.Time, slot bool) {
 	if r.cfg.Quiet && res.status < 400 && res.err == nil {
 		return
 	}
-	kind := "read"
-	if slot {
-		kind = "gen"
-		if out.Rebound {
-			if out.Spilled {
-				kind = "spill" // waited too long on a busy sticky backend
-			} else {
-				kind = "rebind"
-			}
-		}
-	}
+	kind := routeKind(slot, out)
 	model := ""
 	if info.Model != "" {
 		model = " model=" + info.Model

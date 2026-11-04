@@ -27,6 +27,8 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 		r.prometheus(w)
 	case "rooter/models":
 		r.adminCatalog(w)
+	case "rooter/events":
+		r.eventsJSON(w, req)
 	case "rooter/backends":
 		b, _ := json.MarshalIndent(r.pool.Backends(), "", "  ")
 		w.Header().Set("Content-Type", "application/json")
@@ -73,7 +75,7 @@ func (r *Router) adminIndex(w http.ResponseWriter) {
 	} else {
 		fmt.Fprintf(w, "\nno api key set - anyone who can reach this address can spend these backends\n")
 	}
-	fmt.Fprintf(w, "\nendpoints: /rooter/stats /rooter/metrics /rooter/models /rooter/backends /rooter/sessions /rooter/forget?key=K\n")
+	fmt.Fprintf(w, "\nendpoints: /rooter/stats /rooter/metrics /rooter/events /rooter/models /rooter/backends /rooter/sessions /rooter/forget?key=K\n")
 	if r.cfg.NoCatalog {
 		fmt.Fprintf(w, "\n-no-catalog: /v1/models is proxied to one backend, so it reports that backend only\n")
 	}
@@ -198,6 +200,10 @@ func (r *Router) prometheus(w http.ResponseWriter) {
 		fmt.Fprintf(w, "rooter_backend_requests_total%s %v\n", l, b["requests"])
 		fmt.Fprintf(w, "rooter_backend_errors_total%s %v\n", l, b["errors"])
 	}
+	// The per-model families are the point of the whole exercise: a box-level
+	// request count cannot tell you that one model is slow, or that the cache is
+	// being hit on one and not the other.
+	r.promModels(w)
 }
 
 func (r *Router) snapshotTotal() int64 {
