@@ -559,40 +559,59 @@ func (w *replyWriter) observe(p []byte) {
 	}
 }
 
-// firstContentOffset finds the value of the first non-empty content or text field
-// in an SSE chunk and returns its offset, or -1.
+// firstContentOffset finds the value of the first non-empty content-like field in a
+// chunk and returns its offset, or -1.
 //
-// A string scan rather than a parse, on purpose. This runs on the copy path of
-// every streamed byte, and the thing it is distinguishing is llama.cpp's opening
-// chunk, which is the most predictable bytes in the protocol: content:"". Parsing
-// every chunk to find out whether a runner said anything would cost more than the
-// measurement is worth.
+// A string scan rather than a parse, on purpose: this runs on the copy path of every
+// streamed byte, and the thing it is distinguishing is llama.cpp's opening chunk,
+// which is the most predictable bytes in the protocol.
 //
-// reasoning_content is on the list because it is what a thinking model says first,
-// and it is words the user watches. Live proof that it had to be: a sushi response
-// streamed 20 deltas as reasoning_content and exactly one content field, which was
-// the empty opening one - a list containing only content and text reports that call
-// as never having said anything.
+// The scan tolerates whitespace because llama.cpp writes "key": "value" with a space
+// after the colon on one of the two boxes and not the other. A marker written as
+// `"content":"` matched one runner and silently missed the other, and the miss looked
+// exactly like a call that never said anything. This is the same lesson streamRequested
+// already learned about the request side.
+//
+// reasoning_content is on the list because it is what a thinking model says first and
+// it is words the user watches. Live proof: a sushi response streamed twenty deltas as
+// reasoning_content and its only content field was the empty opening one.
 func firstContentOffset(p []byte) int {
-	for _, marker := range []string{`"content":"`, `"reasoning_content":"`, `"text":"`} {
-		needle := []byte(marker)
-		// Note there is no accidental overlap: in "reasoning_content": the character
-		// before content is an underscore, so the shorter marker cannot match it.
-		for i := 0; i+len(needle) < len(p); {
+	for _, key := range []string{`"content"`, `"reasoning_content"`, `"text"`} {
+		needle := []byte(key)
+		// No accidental overlap: in "reasoning_content" the character before content
+		// is an underscore, so the short key cannot match inside it.
+		for i := 0; i < len(p); {
 			at := bytes.Index(p[i:], needle)
 			if at < 0 {
 				break
 			}
-			value := i + at + len(marker)
-			// content:"" is the opening role delta; content:null is a chunk that
-			// carries no words either.
-			if value < len(p) && p[value] != '"' && p[value] != 'n' {
+			j := skipSpace(p, i+at+len(needle))
+			if j >= len(p) || p[j] != ':' {
+				i = j
+				continue
+			}
+			j = skipSpace(p, j+1)
+			if j >= len(p) || p[j] != '"' {
+				// null, a number, or something rooter is not going to call a word.
+				i = j
+				continue
+			}
+			value := j + 1
+			if value < len(p) && p[value] != '"' {
 				return value
 			}
+			// An empty string is the opening role delta, not a token.
 			i = value
 		}
 	}
 	return -1
+}
+
+func skipSpace(p []byte, i int) int {
+	for i < len(p) && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r') {
+		i++
+	}
+	return i
 }
 
 func (w *replyWriter) Write(p []byte) (int, error) {

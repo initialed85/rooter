@@ -794,3 +794,33 @@ func TestEmptyAndNullContentAreNotWords(t *testing.T) {
 		t.Error("a marker at the end of a chunk was missed")
 	}
 }
+
+// One box writes "key": "value", the other writes "key":"value". A marker that
+// assumes one of them reports the other's entire response as containing no words,
+// which is the kind of measurement bug that looks like a feature working.
+func TestWhitespaceAfterTheColonIsNotOptional(t *testing.T) {
+	// Verbatim shapes from the two live runners.
+	llamaSpaced := `data: {"id": "chatcmpl-064dbae0", "object": "chat.completion.chunk", ` +
+		`"model": "qwen-model", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, ` +
+		`"finish_reason": null}]}`
+	llamaTight := `data: {"id":"c9","choices":[{"index":0,"delta":{"reasoning_content":"We"},"finish_reason":null}]}`
+	for name, chunk := range map[string]string{"spaced": llamaSpaced, "tight": llamaTight} {
+		if at := firstContentOffset([]byte(chunk)); at < 0 {
+			t.Errorf("%s runner: no content found in %q", name, chunk)
+		} else {
+			got := chunk[at:]
+			if !strings.HasPrefix(got, "We") {
+				t.Errorf("%s runner: pointed at %q", name, got[:min(len(got), 12)])
+			}
+		}
+	}
+	// The opening chunk of the same spaced runner, which must still not count.
+	opening := `data: {"id": "chatcmpl-064dbae0", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}`
+	if at := firstContentOffset([]byte(opening)); at >= 0 {
+		t.Errorf("empty opening delta looked like content at %d", at)
+	}
+	// A real keep-alive line, which is the other thing that travels between deltas.
+	if at := firstContentOffset([]byte(": keep-alive")); at >= 0 {
+		t.Error("a keep-alive comment looked like content")
+	}
+}
