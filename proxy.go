@@ -34,6 +34,7 @@ type Router struct {
 	waiting   int64
 	rejected  int64
 	denied    int64
+	aborted   int64 // client hung up before the response finished
 	waitTotal time.Duration
 	byStatus  map[int]int64
 	denyNote  map[string]*denyNote
@@ -246,19 +247,61 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.mu.Lock()
 	r.inflight++
 	r.mu.Unlock()
-	res := r.dispatch(ctx, w, req, &held, body, partial, info, &out, slot)
-	if res.status == 0 {
+
+	// res and aborted are read by the deferred accounting below, so they have to
+	// exist before the call that can blow up.
+	var res attempt
+	aborted := false
+	// Every way out of this function has to balance the increment above. It did
+	// not use to: when a client hangs up mid-response, ReverseProxy panics with
+	// http.ErrAbortHandler and net/http recovers that sentinel *silently*, so
+	// nothing after dispatch ran. The deferred slot release did run, which is why
+	// the box looked healthy - rooter_inflight just climbed forever and every
+	// abandoned generation went missing from byStatus. Abandonment is also the
+	// one outcome that says something about answer quality, so it gets a counter
+	// of its own instead of disappearing.
+	defer func() {
+		if p := recover(); p != nil {
+			if p == http.ErrAbortHandler {
+				res = attempt{status: statusAborted, err: errAborted, wrote: true, ttfb: res.ttfb}
+				aborted = true
+			} else {
+				r.settle(w, req, &res, held, info, &out, start, slot, aborted)
+				panic(p) // not ours to interpret; let net/http log it and drop the conn
+			}
+		}
+		r.settle(w, req, &res, held, info, &out, start, slot, aborted)
+	}()
+
+	res = r.dispatch(ctx, w, req, &held, body, partial, info, &out, slot)
+}
+
+// settle closes the books on one proxied exchange. It runs on the normal path
+// and on the panic path, so it must not assume anything about how far dispatch
+// got. Returns the attempt through res so the caller sees the final status.
+func (r *Router) settle(w http.ResponseWriter, req *http.Request, res *attempt, b *Backend, info requestInfo, out *Outcome, start time.Time, slot, aborted bool) {
+	if res.status == 0 && !aborted {
 		res.status = http.StatusBadGateway
 		if !res.wrote {
-			errJSON(w, res.status, fmt.Sprintf("backend %s failed: %v", held.Name, res.err))
+			errJSON(w, res.status, fmt.Sprintf("backend %s failed: %v", b.Name, res.err))
 		}
 	}
 	r.mu.Lock()
 	r.inflight--
 	r.byStatus[res.status]++
+	if aborted {
+		r.aborted++
+	}
 	r.mu.Unlock()
-	r.logLine(req, held, info, out, res, start, slot)
+	r.logLine(req, b, info, *out, *res, start, slot)
 }
+
+// statusAborted is nginx's "client closed request". It is never sent on the
+// wire - a client that hung up cannot read it - it exists so an abandoned
+// generation is a distinct, countable outcome instead of an unrecorded one.
+const statusAborted = 499
+
+var errAborted = errors.New("client closed request")
 
 // attempt reports what one round trip did.
 type attempt struct {

@@ -96,6 +96,7 @@ func (r *Router) Stats() map[string]any {
 		"queued":      r.waiting,
 		"rejected":    r.rejected,
 		"denied":      r.denied,
+		"aborted":     r.aborted,
 		"avgWait":     avg.String(),
 		"auth":        r.auth.enabled(),
 		"status":      status,
@@ -166,11 +167,13 @@ func (r *Router) prometheus(w http.ResponseWriter) {
 	e("rooter_queued", "Requests blocked waiting for a free slot", "gauge")
 	e("rooter_rejected_total", "Requests rejected because nothing was free", "counter")
 	e("rooter_denied_total", "Requests rejected by the front-door API key check", "counter")
+	e("rooter_aborted_total", "Generations the client hung up on before the response finished", "counter")
 	e("rooter_wait_seconds_total", "Time spent waiting for slots", "counter")
 	e("rooter_sessions", "Tracked sessions", "gauge")
 	st := r.Stats()
 	fmt.Fprintf(w, "rooter_inflight %v\nrooter_queued %v\nrooter_rejected_total %v\n", st["inflight"], st["queued"], st["rejected"])
 	fmt.Fprintf(w, "rooter_denied_total %v\n", st["denied"])
+	fmt.Fprintf(w, "rooter_aborted_total %v\n", st["aborted"])
 	fmt.Fprintf(w, "rooter_sessions %v\n", st["sessions_sessions"])
 	fmt.Fprintf(w, "rooter_wait_seconds_total %v\n", r.snapshotWait().Seconds())
 	e("rooter_backend_slots_busy", "Busy concurrency slots per backend", "gauge")
