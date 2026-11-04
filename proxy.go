@@ -173,6 +173,17 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// The model list is rooter's to answer. As a passthrough it reported whichever
+	// box happened to be free, so two calls a second apart disagreed about which
+	// models exist at all - and a client that picked from one of them was routed by
+	// luck. -no-catalog puts the old behaviour back.
+	if !r.cfg.NoCatalog && isModelsPath(req.URL.Path) &&
+		(req.Method == http.MethodGet || req.Method == http.MethodHead) {
+		r.modelCatalog(w, req)
+		r.countStatus(req, http.StatusOK)
+		return
+	}
+
 	// One pass: headers first, then the buffered body prefix. The body is always
 	// scanned when present, because it also carries the requested model, which
 	// routing needs even when the session came from a header.
@@ -182,6 +193,21 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	info := extractKey(req.Header, body, req.Header.Get("Content-Type"))
+
+	// A backend name is a legitimate thing to ask for, and rooter is the only
+	// place that can turn it into a model the box actually has. info.Model stays
+	// the alias on purpose: that is what keeps the pinning and the session binding
+	// honest, while the body going upstream carries the resolved id so the response
+	// echoes a real model rather than a box name.
+	if alias, newBody, resolved := r.resolveAlias(info, body, partial, req.Header.Get("Content-Type")); alias != nil {
+		body = newBody
+		info.Resolved = resolved
+		if resolved != info.Model {
+			if r.cfg.Verbose {
+				r.log.Printf("alias %s -> backend %s model %s", info.Model, alias.Name, resolved)
+			}
+		}
+	}
 
 	slot := needsSlot(req.Method, req.URL.Path, r.cfg.FreePaths)
 	// Bindings are per (session, model): one conversation that switches models
@@ -580,6 +606,9 @@ func (r *Router) logLine(req *http.Request, b *Backend, info requestInfo, out Ou
 	model := ""
 	if info.Model != "" {
 		model = " model=" + info.Model
+		if info.Resolved != "" && info.Resolved != info.Model {
+			model += "->" + info.Resolved // a backend-name alias
+		}
 	}
 	r.log.Printf("%s %s -> %s [%s key=%s(%s)%s status=%d bytes=%d wait=%s ttfb=%s total=%s%s",
 		req.Method, req.URL.Path, b.Name, kind, shortKey(info.Key), info.KeySource, model,
@@ -603,4 +632,13 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	fmt.Fprintf(w, `{"error":{"type":"rooter_error","message":%q}}`, msg)
+}
+
+// countStatus records a response rooter served itself, so the model catalog and
+// the proxied paths land in one histogram instead of the catalog being invisible
+// in /rooter/stats and /rooter/metrics.
+func (r *Router) countStatus(req *http.Request, code int) {
+	r.mu.Lock()
+	r.byStatus[code]++
+	r.mu.Unlock()
 }

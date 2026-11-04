@@ -25,6 +25,8 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 	case "rooter/metrics":
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		r.prometheus(w)
+	case "rooter/models":
+		r.adminCatalog(w)
 	case "rooter/backends":
 		b, _ := json.MarshalIndent(r.pool.Backends(), "", "  ")
 		w.Header().Set("Content-Type", "application/json")
@@ -71,7 +73,10 @@ func (r *Router) adminIndex(w http.ResponseWriter) {
 	} else {
 		fmt.Fprintf(w, "\nno api key set - anyone who can reach this address can spend these backends\n")
 	}
-	fmt.Fprintf(w, "\nendpoints: /rooter/stats /rooter/metrics /rooter/backends /rooter/sessions /rooter/forget?key=K\n")
+	fmt.Fprintf(w, "\nendpoints: /rooter/stats /rooter/metrics /rooter/models /rooter/backends /rooter/sessions /rooter/forget?key=K\n")
+	if r.cfg.NoCatalog {
+		fmt.Fprintf(w, "\n-no-catalog: /v1/models is proxied to one backend, so it reports that backend only\n")
+	}
 }
 
 func (r *Router) Stats() map[string]any {

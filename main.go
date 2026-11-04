@@ -39,6 +39,7 @@ type Config struct {
 	XForwarded     bool
 	Verbose        bool
 	Quiet          bool
+	NoCatalog      bool
 	Version        bool
 }
 
@@ -82,6 +83,11 @@ A -meta-model name is not a model: a request for it may go to any healthy backen
 backend's /models, and a name no backend claims is a 404 rather than an answer
 from another model.
 
+By default rooter answers /v1/models itself, with the union of every backend's
+models plus one entry per backend name ("strata", "sushi") that pins to that box
+and lets it pick its own loaded model. -no-catalog restores the old behaviour,
+where the list came from whichever backend happened to be free.
+
 With -api-key set, every request must carry that key (Authorization: Bearer or
 x-api-key) except the health probes in -public-path. That is what makes it safe to
 publish rooter on a routable address; the backends' own tokens stay in here.
@@ -105,6 +111,7 @@ publish rooter on a routable address; the backends' own tokens stay in here.
 	fs.Var((*stringList)(&c.FreePaths), "free-path", "path suffix that never needs a slot (repeatable)")
 	fs.Var((*stringList)(&c.APIKeys), "api-key", "key clients must present (Authorization: Bearer or x-api-key); repeat for more than one; empty = no front-door auth")
 	fs.Var((*stringList)(&c.PublicPaths), "public-path", "path suffix reachable without -api-key (repeatable)")
+	fs.BoolVar(&c.NoCatalog, "no-catalog", false, "answer /v1/models by proxying to one backend, instead of serving the merged catalog")
 	fs.BoolVar(&c.XForwarded, "xff", false, "let X-Forwarded-For be added to upstream requests")
 	fs.BoolVar(&c.Verbose, "verbose", false, "log retries, queue detail and more")
 	fs.BoolVar(&c.Quiet, "quiet", false, "only log requests that failed")

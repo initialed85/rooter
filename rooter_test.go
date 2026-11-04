@@ -493,12 +493,21 @@ func TestPathJoining(t *testing.T) {
 	a := newFake(t, "a", "test-model", "")
 	e := newEnv(t, []string{"a=" + a.url() + "/v1"}, nil)
 	// A backend registered with a /v1 prefix must not be given /v1/v1/...
-	res, body := e.do(get("/v1/models"))
+	// /v1/models itself is answered by rooter's catalog now, so the joining check
+	// uses a path on the same prefix that still has to reach the backend.
+	res, body := e.do(get("/v1/models/test-model"))
 	if res.StatusCode != 200 {
 		t.Fatalf("status %d %s", res.StatusCode, body)
 	}
-	if p := a.lastPath(); p != "/v1/models" {
-		t.Errorf("path = %q, want /v1/models", p)
+	if p := a.lastPath(); p != "/v1/models/test-model" {
+		t.Errorf("path = %q, want /v1/models/test-model", p)
+	}
+	// The list endpoint is rooter's to answer, and the backend must never see it.
+	if _, body := e.do(get("/v1/models")); !strings.Contains(body, "\"rooter\"") {
+		t.Errorf("/v1/models was not answered by the catalog: %s", body)
+	}
+	if p := a.lastPath(); p == "/v1/models" {
+		t.Errorf("the catalog leaked to the backend")
 	}
 	// A path that does not carry the prefix gets it added.
 	res, body = e.do(get("/health"))

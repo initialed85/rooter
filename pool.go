@@ -100,10 +100,46 @@ func (p *Pool) Backends() []*Backend {
 	return out
 }
 
+// Lookup returns a backend by its configured name.
 func (p *Pool) Lookup(name string) *Backend {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.byName[name]
+}
+
+// Alias resolves a requested model that is really a backend name. "sushi" is not
+// a model, but it is a perfectly good answer to "which box do I want", and it is
+// the only such answer a client can discover on its own - so /v1/models advertises
+// one entry per backend and a request for it pins to that backend and nothing
+// else.
+//
+// Returns the default model to hand upstream, or "" when no backend is named by
+// that id. A real model id always wins over an alias: the collision is resolved
+// in favour of the backend's own inventory, and the synthetic entry is dropped
+// from the catalog to match.
+func (p *Pool) Alias(model string) (*Backend, string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b := p.byName[model]
+	if b == nil {
+		for _, x := range p.backends {
+			if strings.EqualFold(x.Name, model) {
+				b = x
+				break
+			}
+		}
+	}
+	if b == nil {
+		return nil, ""
+	}
+	if b.Models[model] {
+		return nil, "" // a real model that happens to share a box's name
+	}
+	return b, b.DefaultModel
 }
 
 // MarkUnhealthy flips a backend over (used when a round trip fails outright).
@@ -458,11 +494,26 @@ func (p *Pool) Check(b *Backend) error {
 		return fmt.Errorf("bad /models json: %v", err)
 	}
 	models := map[string]bool{}
+	ids := make([]string, 0, len(doc.Data))
 	for _, m := range doc.Data {
-		models[m.ID] = true
+		if m.ID == "" {
+			continue
+		}
+		if !models[m.ID] {
+			models[m.ID] = true
+			ids = append(ids, m.ID)
+		}
 	}
 	p.mu.Lock()
 	b.Models = models
+	// Document order, not sorted: a runner lists the model it actually loaded
+	// first, and that is the one a backend-name alias has to resolve to. Sorting
+	// here would make "sushi" mean whichever id happened to sort lowest.
+	b.ModelIDs = ids
+	b.DefaultModel = ""
+	if len(ids) > 0 {
+		b.DefaultModel = ids[0]
+	}
 	b.Healthy = true
 	b.Checked = time.Now()
 	p.notify()
@@ -573,6 +624,14 @@ func (p *Pool) ModelFilter(model string) func(*Backend) bool {
 	// conversation keeps its cache on one box.
 	if model == "" || p.meta[normalizeModel(model)] {
 		return nil
+	}
+	// A backend name is a legitimate thing to ask for: "sushi" means "that box,
+	// whatever it has loaded", and unlike a meta model it is a hard pin, not a
+	// preference. Restricting eligibility to one backend also makes spill and
+	// rebind structurally impossible, since there is no "rest" to spill onto.
+	if alias, _ := p.Alias(model); alias != nil {
+		name := alias.Name
+		return func(b *Backend) bool { return b.Name == name }
 	}
 	p.mu.Lock()
 	serves := false

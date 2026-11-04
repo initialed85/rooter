@@ -22,13 +22,15 @@ type Backend struct {
 	sem chan struct{}
 
 	// mutable state, Pool.mu
-	Healthy   bool
-	Models    map[string]bool // nil => unknown, treat as serving anything
-	Checked   time.Time
-	LastUsed  time.Time
-	Requests  int64
-	Errors    int64
-	TotalWait time.Duration
+	Healthy      bool
+	Models       map[string]bool // nil => unknown, treat as serving anything
+	ModelIDs     []string        // same ids in /models document order, which is meaningful
+	DefaultModel string          // ModelIDs[0]: what this box is actually serving
+	Checked      time.Time
+	LastUsed     time.Time
+	Requests     int64
+	Errors       int64
+	TotalWait    time.Duration
 }
 
 func (b *Backend) busy() int { return len(b.sem) }
