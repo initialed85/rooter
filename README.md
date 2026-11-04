@@ -208,14 +208,20 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied. If
   counters and a `_cache_hit_ratio` gauge. Labels are always exactly `backend` and
   `model`; session keys are deliberately never a label, because a per-session
   cardinality on a histogram would blow up every series.
-- `GET /rooter/events?since=<id>&limit=<n>` — the last finished calls, newest
-  first, as the same records the log line and the metrics are built from. The ring
-  is bounded (`-event-ring`, default 2048) and drops the oldest half at a time, and
-  the response says so: `stale: true` plus `dropped_total` is how you tell "nothing
-  new" from "you missed it". Ids are `<boot id>/<seq>`, so they cannot be re-issued
-  across a restart - which is exactly when a client retries. On a stream each record
-  carries both `ttft_ms` and `first_content_ms`; they are different quantities and
-  both are kept, for the reason in the measurement note below.
+- `GET /rooter/events?cursor=<seq>&limit=<n>` — the finished calls the ring still
+  holds, oldest first, as the same records the log line and the metrics are built
+  from. The ring is bounded (`-event-ring`, default 2048) and drops the oldest half
+  at a time. Store the `cursor` you are handed back and ask for everything after it;
+  `id` is the dedup key and the cursor is only a position, so a poll that changed
+  nothing returns an empty page and the same cursor. `stale` means the ring no
+  longer holds what your cursor pointed at, judged against the oldest surviving
+  record rather than against an empty page - a consumer that is perfectly caught up
+  also gets an empty page, and calling that data loss would be a flag that trains
+  you to ignore it. Ids are `<boot id>/<seq>`, so they cannot be re-issued across a
+  restart - which is exactly when a client retries; a changed `boot_id` means your
+  cursor is from a life that no longer exists. On a stream each record carries both
+  `ttft_ms` and `first_content_ms`; they are different quantities and both are kept,
+  for the reason in the measurement note below.
 - `GET /rooter/forget?key=p:abc123` — drop a session and every per-model binding
   it holds; a bare id works too (`h:`/`p:` are tried for you), and `key=*` clears
   everything (use it after you restart a backend and its cache is gone)
@@ -247,6 +253,16 @@ different times:
 actually evaluated, which on llama.cpp is the prompt minus whatever it served from
 the KV cache: a 54-token prompt with 49 cached reports `prompt_n` 5. Confusing the
 two makes a cache hit look like a tiny prompt and pushes `cache_hit_rate` above 1.
+
+They are not two spellings of one number, and `prompt_tokens` is not always a
+measurement. It is read from `usage.prompt_tokens` when the runner sends a usage
+block. When it does not - which is what a plain llama.cpp `/completion` does -
+rooter reconstructs it as `prompt_tokens_computed + cached_tokens` and marks the
+row `prompt_tokens_derived: true`. Both are the full prompt length by construction,
+and `cache_hit_rate` is refused rather than corrected when the counts contradict
+each other, so either way it is a safe denominator; the flag exists because a
+reader who cannot tell a read value from a reconstructed one is trusting arithmetic
+they cannot see.
 
 **A stream is never held back and never edited.** Those bytes are the user's
 tokens arriving, and buffering them to be clever about metadata is a terrible

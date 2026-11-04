@@ -97,6 +97,17 @@ type callRecord struct {
 	// From the response body. Absent when the client hung up before the tail,
 	// which is the whole reason these are pointers rather than zero defaults.
 	PromptTokens *int `json:"prompt_tokens,omitempty"`
+	// PromptTokensDerived marks the rows where rooter computed prompt_tokens itself
+	// as prompt_tokens_computed + cached_tokens, because the runner sent timings but
+	// no usage block - which is what a plain llama.cpp /completion does. When it is
+	// false the number came straight out of usage.prompt_tokens.
+	//
+	// It is published because prompt_tokens is the denominator of every cache rate
+	// anyone builds from this, and a reader who cannot tell a read value from a
+	// reconstructed one is trusting arithmetic they cannot see. Both are the full
+	// prompt length by construction; the flag is for auditing, not for a different
+	// formula.
+	PromptTokensDerived bool `json:"prompt_tokens_derived,omitempty"`
 	// PromptTokensComputed is what the runner actually evaluated this call, which
 	// llama.cpp calls prompt_n and is NOT the prompt length: it is the prompt minus
 	// whatever it served from the KV cache. On a live strata call the prompt was 54
@@ -219,6 +230,11 @@ func (c *callRecord) absorb(doc *timingsDoc) {
 			total += *c.CachedTokens
 		}
 		c.PromptTokens = &total
+		// Say so on the row. This is the only place rooter turns two measurements
+		// into a third, and `prompt_tokens` is the denominator of every cache rate
+		// anyone computes from this. A reader who cannot tell a read value from a
+		// reconstructed one is trusting arithmetic they cannot see.
+		c.PromptTokensDerived = true
 	}
 	seti(&c.CompletionTokens, t.PredictedN)
 	// Derive the rates when a runner gave counts and a duration but no throughput,

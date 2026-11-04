@@ -364,7 +364,7 @@ func (r *Router) eventsJSON(w http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(w)
 	_ = enc.Encode(eventsPage{
 		Cursor:    cursor,
-		Stale:     after > 0 && dropped > 0 && len(out) == 0,
+		Stale:     r.events.stale(after),
 		Dropped:   dropped,
 		Available: r.events.len(),
 		BootID:    r.bootID,
@@ -396,6 +396,29 @@ func (e *eventRing) len() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return len(e.events)
+}
+
+// stale says whether a consumer's cursor points behind something the ring has
+// already evicted.
+//
+// It is judged against the oldest surviving record rather than against "the page
+// came back empty". The first version of this was the latter, and it was wrong in
+// both directions: a consumer that is perfectly caught up gets an empty page and
+// would be told it had missed data, while a consumer whose cursor sat behind the
+// eviction boundary but happened to have new records after it would be told
+// nothing. A gap is a property of the ring and the cursor, not of the page, and
+// a harvester that resumes from a wrong "you are fine" silently loses rows.
+func (e *eventRing) stale(after int64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if after <= 0 {
+		// A consumer that never had a cursor is starting fresh, not losing its place.
+		return false
+	}
+	if len(e.events) == 0 {
+		return e.dropped > 0
+	}
+	return e.events[0].Seq > after+1
 }
 
 // ---------------------------------------------------------------------------
