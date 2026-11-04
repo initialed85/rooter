@@ -567,9 +567,17 @@ func (w *replyWriter) observe(p []byte) {
 // chunk, which is the most predictable bytes in the protocol: content:"". Parsing
 // every chunk to find out whether a runner said anything would cost more than the
 // measurement is worth.
+//
+// reasoning_content is on the list because it is what a thinking model says first,
+// and it is words the user watches. Live proof that it had to be: a sushi response
+// streamed 20 deltas as reasoning_content and exactly one content field, which was
+// the empty opening one - a list containing only content and text reports that call
+// as never having said anything.
 func firstContentOffset(p []byte) int {
-	for _, marker := range []string{`"content":"`, `"text":"`} {
+	for _, marker := range []string{`"content":"`, `"reasoning_content":"`, `"text":"`} {
 		needle := []byte(marker)
+		// Note there is no accidental overlap: in "reasoning_content": the character
+		// before content is an underscore, so the shorter marker cannot match it.
 		for i := 0; i+len(needle) < len(p); {
 			at := bytes.Index(p[i:], needle)
 			if at < 0 {

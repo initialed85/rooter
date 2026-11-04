@@ -213,7 +213,9 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied. If
   is bounded (`-event-ring`, default 2048) and drops the oldest half at a time, and
   the response says so: `stale: true` plus `dropped_total` is how you tell "nothing
   new" from "you missed it". Ids are `<boot id>/<seq>`, so they cannot be re-issued
-  across a restart - which is exactly when a client retries.
+  across a restart - which is exactly when a client retries. Each record carries
+  `ttft_ms` and, on a stream, `first_content_ms`; they are different quantities and
+  both are kept, for the reason in the measurement note below.
 - `GET /rooter/forget?key=p:abc123` — drop a session and every per-model binding
   it holds; a bare id works too (`h:`/`p:` are tried for you), and `key=*` clears
   everything (use it after you restart a backend and its cache is gone)

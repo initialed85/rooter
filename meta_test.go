@@ -715,8 +715,10 @@ func TestFirstByteAndFirstWordAreSeparateMeasurements(t *testing.T) {
 			`","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`+"\n\n")
 		fl.Flush()
 		time.Sleep(gap)
+		// What a thinking model actually streams first is reasoning_content. This
+		// fixture is copied from a live sushi response rather than from the spec.
 		io.WriteString(w, `data: {"id":"c9","object":"chat.completion.chunk","model":"`+model+
-			`","choices":[{"index":0,"delta":{"content":"one"}}]}`+"\n\n")
+			`","choices":[{"index":0,"delta":{"reasoning_content":"one"},"finish_reason":null}],"usage":null}`+"\n\n")
 		fl.Flush()
 		io.WriteString(w, `data: {"id":"c9","object":"chat.completion.chunk","model":"`+model+
 			`","choices":[],"usage":{"completion_tokens":3},"timings":{"prompt_n":3,"predicted_n":3,"predicted_ms":15,"treat_toks":true}}`+"\n\n")
@@ -764,6 +766,8 @@ func TestEmptyAndNullContentAreNotWords(t *testing.T) {
 		`data: {"choices":[{"delta":{"role":"assistant","content":""}}]}`,
 		`data: {"choices":[{"delta":{"content":null}}]}`,
 		`data: {"choices":[{"delta":{"tool_calls":[{"id":"1"}]}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":""}}]}`,
+		`data: {"choices":[],"usage":{"completion_tokens":3},"timings":{"predicted_ms":1}}`,
 	} {
 		if at := firstContentOffset([]byte(chunk)); at >= 0 {
 			t.Errorf("%q looked like content at %d", chunk, at)
@@ -773,6 +777,11 @@ func TestEmptyAndNullContentAreNotWords(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":"x"}}]}`,
 		`data: {"choices":[{"delta":{"content":"{\"json\": true}"}}]}`,
 		`data: {"choices":[{"text":"x"}]}`,
+		// A thinking model says this first, and live is worse: a sushi response
+		// streamed twenty deltas as reasoning_content and its only content field was
+		// the empty opening one.
+		`data: {"choices":[{"delta":{"reasoning_content":"The"}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":""},"content":"x"}]}`,
 	} {
 		if at := firstContentOffset([]byte(chunk)); at < 0 {
 			t.Errorf("%q looked like nothing", chunk)
