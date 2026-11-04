@@ -42,7 +42,7 @@ func richFake(t *testing.T, name, model string) *httptest.Server {
 	tj := mustJSON(t, timings)
 	usage := `,"usage":{"prompt_tokens":1000,"completion_tokens":40}`
 
-	plain := `{"id":"c1","model":"` + model + `","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]` +
+	plain := `{"id":"c1","created":1793000000,"model":"` + model + `","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]` +
 		usage + `,"timings":` + tj + `}`
 	chunkA := `data: {"id":"c1","object":"chat.completion.chunk","model":"` + model +
 		`","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}` + "\n\n"
@@ -424,8 +424,9 @@ func TestUpstreamIDIsTheJoinKey(t *testing.T) {
 		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "join"))
 	var doc struct {
 		Rooter struct {
-			ID         string `json:"id"`
-			UpstreamID string `json:"upstream_id"`
+			ID              string `json:"id"`
+			UpstreamID      string `json:"upstream_id"`
+			UpstreamCreated int64  `json:"upstream_created"`
 		} `json:"rooter"`
 	}
 	if err := json.Unmarshal([]byte(out), &doc); err != nil {
@@ -436,6 +437,11 @@ func TestUpstreamIDIsTheJoinKey(t *testing.T) {
 	}
 	if doc.Rooter.ID == doc.Rooter.UpstreamID {
 		t.Errorf("rooter's id and the runner's id are the same value: %q", doc.Rooter.ID)
+	}
+	// The runner's own timestamp is the only value its self-indexed per-request
+	// detail and rooter's record reliably agree on, so it has to be captured.
+	if doc.Rooter.UpstreamCreated == 0 {
+		t.Errorf("the runner's own completion timestamp was not captured")
 	}
 	// A stream's id arrives in the first chunk, so it is captured the same way.
 	req := withSession(postJSON("/v1/chat/completions",

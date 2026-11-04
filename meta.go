@@ -48,14 +48,22 @@ type callRecord struct {
 	// own id, which rooter sees in the response body and a client has no way to
 	// attribute back to a routed call.
 	UpstreamID string `json:"upstream_id,omitempty"`
-	TS         string `json:"ts"`
-	Path       string `json:"path"`
-	Method     string `json:"method"`
-	Kind       string `json:"kind"` // read | gen | spill | rebind
-	Key        string `json:"key"`
-	KeySource  string `json:"key_source"`
-	Backend    string `json:"backend"`
-	BackendURL string `json:"backend_url"`
+	// UpstreamCreated is the epoch second the runner stamped on the completion.
+	// It is here because the per-request detail a runner keeps about itself is
+	// indexed by its own clock and its own id, neither of which is the id in the
+	// body: strata's /metrics calls the same call "cbace0dbb29f" while answering
+	// with "chatcmpl-23a156df...". A consumer that wants the runner's richer row
+	// has to join on something, and the runner's own timestamp plus its token and
+	// timing counts are the only values both sides agree on.
+	UpstreamCreated int64  `json:"upstream_created,omitempty"`
+	TS              string `json:"ts"`
+	Path            string `json:"path"`
+	Method          string `json:"method"`
+	Kind            string `json:"kind"` // read | gen | spill | rebind
+	Key             string `json:"key"`
+	KeySource       string `json:"key_source"`
+	Backend         string `json:"backend"`
+	BackendURL      string `json:"backend_url"`
 
 	// Model is what actually answered. Only rooter can say this: an upstream
 	// echoes whatever the client asked for, so "auto" comes back as "auto".
@@ -96,6 +104,7 @@ type callRecord struct {
 // parse, and the two spellings of the cache field are folded together.
 type timingsDoc struct {
 	ID      string          `json:"id"`
+	Created int64           `json:"created"`
 	Model   string          `json:"model"`
 	Timings json.RawMessage `json:"timings"`
 	Usage   struct {
@@ -129,6 +138,9 @@ type timingsRaw struct {
 func (c *callRecord) absorb(doc *timingsDoc) {
 	if c.UpstreamID == "" && doc.ID != "" {
 		c.UpstreamID = doc.ID
+	}
+	if c.UpstreamCreated == 0 && doc.Created > 0 {
+		c.UpstreamCreated = doc.Created
 	}
 	if doc.Model != "" && doc.Model != "auto" && doc.Model != "default" {
 		c.Model = doc.Model
