@@ -201,10 +201,58 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied. If
 - `GET /rooter/stats` — JSON: per-backend health/busy/slots/models, queue,
   denial and status counters, session hit/miss/rebind totals
 - `GET /rooter/backends`, `GET /rooter/sessions` — the same, split up
-- `GET /rooter/metrics` — Prometheus gauges and counters
+- `GET /rooter/metrics` — Prometheus gauges and counters, plus per-`(backend,
+  model)` families: `rooter_model_duration_seconds`, `_ttft_seconds`,
+  `_prefill_seconds`, `_decode_seconds` histograms, `_requests_total`,
+  `_errors_total`, `_aborted_total`, `_tokens_total{kind=prompt|completion|cached}`
+  counters and a `_cache_hit_ratio` gauge. Labels are always exactly `backend` and
+  `model`; session keys are deliberately never a label, because a per-session
+  cardinality on a histogram would blow up every series.
+- `GET /rooter/events?since=<id>&limit=<n>` — the last finished calls, newest
+  first, as the same records the log line and the metrics are built from. The ring
+  is bounded (`-event-ring`, default 2048) and drops the oldest half at a time, and
+  the response says so: `stale: true` plus `dropped_total` is how you tell "nothing
+  new" from "you missed it". Ids are `<boot id>/<seq>`, so they cannot be re-issued
+  across a restart - which is exactly when a client retries.
 - `GET /rooter/forget?key=p:abc123` — drop a session and every per-model binding
   it holds; a bare id works too (`h:`/`p:` are tried for you), and `key=*` clears
   everything (use it after you restart a backend and its cache is gone)
+
+### What rooter adds to a response
+
+A `model` of `auto` comes back saying `auto`, which tells a client nothing about
+what answered. Rooter fixes that on two surfaces, because they are needed at
+different times:
+
+- `X-Rooter-Request-Id`, `-Backend`, `-Model`, `-Route`, `-Wait-Ms`,
+  `-Streamed` on every proxied response. These are settled before a byte moves, so
+  a client rendering a footer while the tokens are still arriving can have them
+  now. `X-Rooter-Model` is the *routing decision*: for `auto` it is `auto`, because
+  rooter genuinely does not know which model the box will pick until it answers.
+- `X-Rooter-Ttft-Ms` and a `rooter` object, on **non-streaming JSON bodies only**.
+  A held body is the one case where a header can still carry a number measured
+  during the response, and it is the one body rooter can safely extend. The object
+  carries the runner's own per-token numbers, normalised: both boxes report
+  timings and they disagree on the cache field's name (`cache_n` versus
+  `cached_n`), so those fold into `cached_tokens`, rates are derived when a runner
+  gave counts and a duration but no throughput, and the runner's raw `timings` is
+  kept verbatim under `extra` so anything rooter does not model is still
+  recoverable.
+
+`prompt_tokens` is the prompt length. `prompt_tokens_computed` is what the runner
+actually evaluated, which on llama.cpp is the prompt minus whatever it served from
+the KV cache: a 54-token prompt with 49 cached reports `prompt_n` 5. Confusing the
+two makes a cache hit look like a tiny prompt and pushes `cache_hit_rate` above 1.
+
+**A stream is never held back and never edited.** Those bytes are the user's
+tokens arriving, and buffering them to be clever about metadata is a terrible
+trade, so rooter reads a stream's tail and passes it through untouched. That makes
+the usage and timing fields `null` on an abandoned call rather than zero, which is
+the honest answer: a generation the client hung up on did not use no tokens, it
+reported none.
+
+`-no-meta` turns all of this off; `-meta-tail 0` keeps the headers and stops rooter
+reading response bodies at all.
 
 ## Pointing Pi at it
 

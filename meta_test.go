@@ -513,3 +513,98 @@ func TestTTFTHeaderExistsOnlyWhereItCanBeMeasured(t *testing.T) {
 		t.Errorf("a stream claimed a time-to-first-byte of %q that rooter cannot measure", got)
 	}
 }
+
+// The live shape that broke this: strata reported a 54-token prompt, of which it
+// served 49 from the KV cache and evaluated only 5. Reading prompt_n as the prompt
+// length made the prompt look like 5 tokens and the cache hit rate 9.8, which is
+// not a number a dashboard can use.
+func TestPromptNIsTheWorkNotThePrompt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			io.WriteString(w, "ok")
+			return
+		}
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"object":"list","data":[{"id":"qwen-model"}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","model":"qwen-model","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":54,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":49}},`+
+			`"timings":{"prompt_n":5,"prompt_ms":142.8,"prompt_per_second":35,"predicted_n":8,"predicted_ms":169.2,`+
+			`"predicted_per_second":47.3,"cache_n":49}}`)
+	}))
+	t.Cleanup(srv.Close)
+	e := newEnv(t, []string{"strata=" + srv.URL}, nil)
+	e.pool.CheckAll()
+	_, out := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "pn"))
+	var doc struct {
+		Rooter callRecord `json:"rooter"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	rec := doc.Rooter
+	if rec.PromptTokens == nil || *rec.PromptTokens != 54 {
+		t.Errorf("prompt_tokens = %v, want the 54-token prompt total", deref(rec.PromptTokens))
+	}
+	if rec.PromptTokensComputed == nil || *rec.PromptTokensComputed != 5 {
+		t.Errorf("prompt_tokens_computed = %v, want the 5 tokens the runner evaluated", deref(rec.PromptTokensComputed))
+	}
+	if rec.CachedTokens == nil || *rec.CachedTokens != 49 {
+		t.Errorf("cached_tokens = %v, want 49", deref(rec.CachedTokens))
+	}
+	if rec.CacheHitRate == nil || *rec.CacheHitRate > 1 {
+		t.Errorf("cache_hit_rate = %v, want 49/54 and never above 1", deref(rec.CacheHitRate))
+	}
+	// Prefill throughput is priced against the work done, so a warm cache cannot
+	// invent speed: 5 tokens over 142.8ms is 35 tok/s, not 54/142.8.
+	if rec.PrefillTokS == nil || *rec.PrefillTokS != 35 {
+		t.Errorf("prefill_tok_s = %v, want 35", deref(rec.PrefillTokS))
+	}
+}
+
+// A runner with no usage block at all - a plain llama.cpp /completion - still has
+// to produce a prompt total, which is the work plus whatever was cached.
+func TestPromptTotalIsReconstructedWhenOnlyTimingsExist(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			io.WriteString(w, "ok")
+			return
+		}
+		if r.URL.Path == "/models" {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"object":"list","data":[{"id":"qwen-model"}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","model":"qwen-model","timings":{"prompt_n":5,"prompt_ms":142.8,`+
+			`"predicted_n":8,"predicted_ms":169.2,"predicted_per_second":47.3,"cache_n":49}}`)
+	}))
+	t.Cleanup(srv.Close)
+	e := newEnv(t, []string{"strata=" + srv.URL}, nil)
+	e.pool.CheckAll()
+	_, out := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "pn2"))
+	var doc struct {
+		Rooter callRecord `json:"rooter"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Rooter.PromptTokens == nil || *doc.Rooter.PromptTokens != 54 {
+		t.Errorf("prompt_tokens = %v, want 54 reconstructed from 5 evaluated plus 49 cached", deref(doc.Rooter.PromptTokens))
+	}
+	if doc.Rooter.CacheHitRate == nil || *doc.Rooter.CacheHitRate > 1 {
+		t.Errorf("cache_hit_rate = %v, want 49/54", deref(doc.Rooter.CacheHitRate))
+	}
+}
+
+func deref[T any](p *T) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}

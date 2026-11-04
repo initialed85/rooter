@@ -84,15 +84,22 @@ type callRecord struct {
 
 	// From the response body. Absent when the client hung up before the tail,
 	// which is the whole reason these are pointers rather than zero defaults.
-	PromptTokens     *int     `json:"prompt_tokens,omitempty"`
-	CompletionTokens *int     `json:"completion_tokens,omitempty"`
-	CachedTokens     *int     `json:"cached_tokens,omitempty"`
-	PrefillMs        *float64 `json:"prefill_ms,omitempty"`
-	PrefillTokS      *float64 `json:"prefill_tok_s,omitempty"`
-	DecodeMs         *float64 `json:"decode_ms,omitempty"`
-	DecodeTokS       *float64 `json:"decode_tok_s,omitempty"`
-	CacheHitRate     *float64 `json:"cache_hit_rate,omitempty"`
-	FinishReason     string   `json:"finish_reason,omitempty"`
+	PromptTokens *int `json:"prompt_tokens,omitempty"`
+	// PromptTokensComputed is what the runner actually evaluated this call, which
+	// llama.cpp calls prompt_n and is NOT the prompt length: it is the prompt minus
+	// whatever it served from the KV cache. On a live strata call the prompt was 54
+	// tokens and prompt_n was 5, because 49 were cached. Publishing prompt_n as
+	// prompt_tokens makes a cache hit look like a tiny prompt and pushes
+	// cache_hit_rate above 1, which is how this bug reached production.
+	PromptTokensComputed *int     `json:"prompt_tokens_computed,omitempty"`
+	CompletionTokens     *int     `json:"completion_tokens,omitempty"`
+	CachedTokens         *int     `json:"cached_tokens,omitempty"`
+	PrefillMs            *float64 `json:"prefill_ms,omitempty"`
+	PrefillTokS          *float64 `json:"prefill_tok_s,omitempty"`
+	DecodeMs             *float64 `json:"decode_ms,omitempty"`
+	DecodeTokS           *float64 `json:"decode_tok_s,omitempty"`
+	CacheHitRate         *float64 `json:"cache_hit_rate,omitempty"`
+	FinishReason         string   `json:"finish_reason,omitempty"`
 
 	// Extra is the upstream's own timings object, verbatim. Rooter normalises the
 	// fields above and keeps nothing of the source shape, so anything it does not
@@ -183,8 +190,6 @@ func (c *callRecord) absorb(doc *timingsDoc) {
 	setf(&c.PrefillTokS, t.PromptPerSecond)
 	setf(&c.DecodeMs, t.PredictedMS)
 	setf(&c.DecodeTokS, t.PredictedPerSecond)
-	seti(&c.PromptTokens, t.PromptN)
-	seti(&c.CompletionTokens, t.PredictedN)
 	// The cache field under either spelling, and usage.cached_tokens if the
 	// runner got there first.
 	if t.CacheN != nil {
@@ -192,20 +197,38 @@ func (c *callRecord) absorb(doc *timingsDoc) {
 	} else if t.CachedN != nil {
 		c.CachedTokens = t.CachedN
 	}
+	// prompt_n is the work done, not the prompt size. It becomes its own field, and
+	// the prompt total is reconstructed from it plus the cache when the runner did
+	// not report a usage block - which is what a plain llama.cpp /completion does.
+	c.PromptTokensComputed = t.PromptN
+	if c.PromptTokens == nil && t.PromptN != nil {
+		total := *t.PromptN
+		if c.CachedTokens != nil {
+			total += *c.CachedTokens
+		}
+		c.PromptTokens = &total
+	}
+	seti(&c.CompletionTokens, t.PredictedN)
 	// Derive the rates when a runner gave counts and a duration but no throughput,
 	// so the footer works against any llama.cpp build rather than only the two
-	// shapes seen on this network.
-	if c.PrefillTokS == nil && c.PrefillMs != nil && c.PromptTokens != nil && *c.PrefillMs > 0 && *c.PromptTokens > 0 {
-		v := float64(*c.PromptTokens) / (*c.PrefillMs / 1000)
+	// shapes seen on this network. Prefill is priced against the tokens the runner
+	// actually evaluated, not the prompt length, or a warm cache invents speed.
+	if c.PrefillTokS == nil && c.PrefillMs != nil && c.PromptTokensComputed != nil && *c.PrefillMs > 0 && *c.PromptTokensComputed > 0 {
+		v := float64(*c.PromptTokensComputed) / (*c.PrefillMs / 1000)
 		c.PrefillTokS = &v
 	}
 	if c.DecodeTokS == nil && c.DecodeMs != nil && c.CompletionTokens != nil && *c.DecodeMs > 0 && *c.CompletionTokens > 0 {
 		v := float64(*c.CompletionTokens) / (*c.DecodeMs / 1000)
 		c.DecodeTokS = &v
 	}
-	if c.CachedTokens != nil && c.PromptTokens != nil && *c.PromptTokens > 0 {
+	// A hit rate is only meaningful against the prompt total. Cached tokens cannot
+	// exceed it, and if the two disagree the runner said something rooter cannot
+	// reconcile, so rooter says nothing rather than publishing 9.8.
+	if c.CachedTokens != nil && c.PromptTokens != nil && *c.PromptTokens > 0 && *c.CachedTokens >= 0 && *c.CachedTokens <= *c.PromptTokens {
 		v := float64(*c.CachedTokens) / float64(*c.PromptTokens)
 		c.CacheHitRate = &v
+	} else {
+		c.CacheHitRate = nil
 	}
 }
 
