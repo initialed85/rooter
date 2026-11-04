@@ -506,6 +506,10 @@ type replyWriter struct {
 	tail      []byte // bounded ring of the last bytes written, for timing parsing
 	maxTail   int
 	maxBuf    int
+	// firstContent is how long after rooter started responding the client received
+	// a character to read, and contentSeen says whether one ever arrived.
+	firstContent time.Duration
+	contentSeen  bool
 }
 
 func (w *replyWriter) Header() http.Header { return w.ResponseWriter.Header() }
@@ -543,6 +547,44 @@ func (w *replyWriter) observe(p []byte) {
 	if over := len(w.tail) - w.maxTail; over > 0 {
 		w.tail = append(w.tail[:0], w.tail[over:]...)
 	}
+	// A stream's first byte and its first word are not the same moment, and the
+	// difference is the runner's internal queue. Scanning the ring rather than this
+	// one chunk means a marker split across two writes is still seen, and it stops
+	// mattering the moment the first real chunk goes past.
+	if !w.contentSeen && !w.buffering && len(w.tail) > 0 {
+		if at := firstContentOffset(w.tail); at >= 0 {
+			w.firstContent = time.Since(w.started)
+			w.contentSeen = true
+		}
+	}
+}
+
+// firstContentOffset finds the value of the first non-empty content or text field
+// in an SSE chunk and returns its offset, or -1.
+//
+// A string scan rather than a parse, on purpose. This runs on the copy path of
+// every streamed byte, and the thing it is distinguishing is llama.cpp's opening
+// chunk, which is the most predictable bytes in the protocol: content:"". Parsing
+// every chunk to find out whether a runner said anything would cost more than the
+// measurement is worth.
+func firstContentOffset(p []byte) int {
+	for _, marker := range []string{`"content":"`, `"text":"`} {
+		needle := []byte(marker)
+		for i := 0; i+len(needle) < len(p); {
+			at := bytes.Index(p[i:], needle)
+			if at < 0 {
+				break
+			}
+			value := i + at + len(marker)
+			// content:"" is the opening role delta; content:null is a chunk that
+			// carries no words either.
+			if value < len(p) && p[value] != '"' && p[value] != 'n' {
+				return value
+			}
+			i = value
+		}
+	}
+	return -1
 }
 
 func (w *replyWriter) Write(p []byte) (int, error) {

@@ -692,3 +692,96 @@ func fakeTimingsServer(t *testing.T) *httptest.Server {
 	t.Cleanup(srv.Close)
 	return srv
 }
+
+// The runner opens a stream with an empty delta, so the first byte and the first
+// word are different moments and only one of them is what a reader experienced.
+// Rooter has to report both or a dashboard silently graphs queue admission as
+// responsiveness.
+func TestFirstByteAndFirstWordAreSeparateMeasurements(t *testing.T) {
+	const model = "qwen-model"
+	gap := 250 * time.Millisecond
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
+	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[{"id":"`+model+`"}]}`)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		// What llama.cpp actually sends first.
+		io.WriteString(w, `data: {"id":"c9","object":"chat.completion.chunk","model":"`+model+
+			`","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}`+"\n\n")
+		fl.Flush()
+		time.Sleep(gap)
+		io.WriteString(w, `data: {"id":"c9","object":"chat.completion.chunk","model":"`+model+
+			`","choices":[{"index":0,"delta":{"content":"one"}}]}`+"\n\n")
+		fl.Flush()
+		io.WriteString(w, `data: {"id":"c9","object":"chat.completion.chunk","model":"`+model+
+			`","choices":[],"usage":{"completion_tokens":3},"timings":{"prompt_n":3,"predicted_n":3,"predicted_ms":15,"treat_toks":true}}`+"\n\n")
+		io.WriteString(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	e := newEnv(t, []string{"strata=" + srv.URL}, nil)
+	e.pool.CheckAll()
+	e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","stream":true,"messages":[{"role":"user","content":"go"}]}`), "words"))
+
+	_, page := e.do(get("/rooter/events?limit=1"))
+	var got eventsPage
+	if err := json.Unmarshal([]byte(page), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Events) != 1 {
+		t.Fatalf("%d events", len(got.Events))
+	}
+	rec := got.Events[0]
+	if rec.FirstContentMs == nil {
+		t.Fatal("no first_content_ms on a streamed call")
+	}
+	first := *rec.FirstContentMs
+	if first < 200 {
+		t.Errorf("first_content_ms = %.1f, the gap was %s", first, gap)
+	}
+	if first <= rec.TTFTMs {
+		t.Errorf("first word (%.1f) arrived no later than first byte (%.1f)", first, rec.TTFTMs)
+	}
+	// The runner's own throughput is unaffected by any of this, and the point of
+	// keeping both numbers is that a reader can subtract one from the other.
+	if rec.DecodeTokS == nil || *rec.DecodeTokS <= 0 {
+		t.Errorf("decode_tok_s = %v", rec.DecodeTokS)
+	}
+}
+
+// An empty delta is not content, and neither is a null one. A scan that called
+// either a first word would report the opening chunk of every stream as a token.
+func TestEmptyAndNullContentAreNotWords(t *testing.T) {
+	for _, chunk := range []string{
+		`data: {"choices":[{"delta":{"role":"assistant","content":""}}]}`,
+		`data: {"choices":[{"delta":{"content":null}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"1"}]}}]}`,
+	} {
+		if at := firstContentOffset([]byte(chunk)); at >= 0 {
+			t.Errorf("%q looked like content at %d", chunk, at)
+		}
+	}
+	for _, chunk := range []string{
+		`data: {"choices":[{"delta":{"content":"x"}}]}`,
+		`data: {"choices":[{"delta":{"content":"{\"json\": true}"}}]}`,
+		`data: {"choices":[{"text":"x"}]}`,
+	} {
+		if at := firstContentOffset([]byte(chunk)); at < 0 {
+			t.Errorf("%q looked like nothing", chunk)
+		}
+	}
+	// Split across two writes is the reason the scan reads the ring and not the
+	// chunk: the marker can straddle a boundary.
+	whole := []byte(`prefix "content":"he`)
+	if at := firstContentOffset(whole); at < 0 {
+		t.Error("a marker at the end of a chunk was missed")
+	}
+}

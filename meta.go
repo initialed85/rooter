@@ -86,6 +86,13 @@ type callRecord struct {
 	WaitMs  float64 `json:"wait_ms"`
 	TTFTMs  float64 `json:"ttft_ms"`
 	TotalMs float64 `json:"total_ms"`
+	// FirstContentMs is when the client received a character to read, on a stream.
+	// It is not a refinement of ttft_ms, it is a different quantity: ttft_ms is the
+	// first byte, and a runner that opens its stream with an empty delta answers
+	// that in tens of milliseconds while the first word is seconds away. Consumers
+	// graphing responsiveness need this one; consumers graphing whether the box was
+	// admitting work need ttft_ms. Both are kept because both are true.
+	FirstContentMs *float64 `json:"first_content_ms,omitempty"`
 
 	// From the response body. Absent when the client hung up before the tail,
 	// which is the whole reason these are pointers rather than zero defaults.
@@ -419,6 +426,13 @@ func (r *Router) finishRecord(w *replyWriter, rec *callRecord, res *attempt, b *
 	// carry the identical number instead of three renderings of one value.
 	rec.TTFTMs = roundMs(res.ttfb)
 	rec.TotalMs = roundMs(time.Since(start))
+	// Only a stream needs this, and only a stream can supply it: on a held body the
+	// first byte is the whole response and the two numbers would be the same one
+	// printed twice.
+	if !w.buffering && w.contentSeen {
+		ms := roundMs(w.firstContent)
+		rec.FirstContentMs = &ms
+	}
 	if res.err != nil && !aborted {
 		rec.Error = res.err.Error()
 	}
