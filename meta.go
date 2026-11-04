@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -37,6 +38,7 @@ const (
 	hdrRoute     = "X-Rooter-Route"
 	hdrWaitMs    = "X-Rooter-Wait-Ms"
 	hdrStreamed  = "X-Rooter-Streamed"
+	hdrTtftMs    = "X-Rooter-Ttft-Ms"
 )
 
 // callRecord is one proxied exchange, as rooter saw it.
@@ -281,6 +283,11 @@ func injectRooterObject(body []byte, rec any) ([]byte, bool) {
 
 // headerWriter sets rooter's headers. Every one of these is known before the
 // response starts, which is exactly why they are headers and not body fields.
+// roundMs is the single place a duration becomes a number a client reads.
+func roundMs(d time.Duration) float64 {
+	return math.Round(float64(d)/float64(time.Millisecond)*1000) / 1000
+}
+
 func setMetaHeaders(h http.Header, rec *callRecord) {
 	h.Set(hdrRequestID, rec.ID)
 	h.Set(hdrBackend, rec.Backend)
@@ -370,8 +377,11 @@ func (r *Router) finishRecord(w *replyWriter, rec *callRecord, res *attempt, b *
 	rec.Status = res.status
 	rec.Bytes = res.bytes
 	rec.Aborted = aborted
-	rec.TTFTMs = float64(res.ttfb) / float64(time.Millisecond)
-	rec.TotalMs = float64(time.Since(start)) / float64(time.Millisecond)
+	// Millisecond resolution is what these measurements are worth, and rounding
+	// once here is what makes the header, the body object and the event record
+	// carry the identical number instead of three renderings of one value.
+	rec.TTFTMs = roundMs(res.ttfb)
+	rec.TotalMs = roundMs(time.Since(start))
 	if res.err != nil && !aborted {
 		rec.Error = res.err.Error()
 	}
@@ -400,6 +410,14 @@ func (r *Router) finishRecord(w *replyWriter, rec *callRecord, res *attempt, b *
 			} else {
 				rec.absorbJSON(w.tail)
 			}
+		}
+		// Time to first byte is publishable as a header only while the header has
+		// not gone out yet, and a held body is the one case where it has not: a
+		// stream's first byte and its headers are the same instant. Set it from the
+		// record rather than the writer so the header, the body object and the
+		// event ring cannot disagree about what the number means.
+		if w.buffering && rec.TTFTMs > 0 {
+			w.Header().Set(hdrTtftMs, strconv.FormatFloat(rec.TTFTMs, 'f', -1, 64))
 		}
 		// Abandoned streams have no tail worth reading, and that is the point:
 		// the usage and timing fields stay null rather than reading as zero, so

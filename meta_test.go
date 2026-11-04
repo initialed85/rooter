@@ -464,3 +464,52 @@ func TestUpstreamIDIsTheJoinKey(t *testing.T) {
 		t.Errorf("a streamed call did not capture the runner's id")
 	}
 }
+
+// A held body lets rooter publish time-to-first-byte as a header; a stream does
+// not, because a stream's first byte and its headers are the same instant.
+// Publishing a number that cannot be measured would be worse than publishing none.
+func TestTTFTHeaderExistsOnlyWhereItCanBeMeasured(t *testing.T) {
+	s := richFake(t, "strata", "qwen-model")
+	e := newEnv(t, []string{"strata=" + s.URL}, nil)
+	e.pool.CheckAll()
+
+	res, _ := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "ttft-a"))
+	hdr := res.Header.Get("X-Rooter-Ttft-Ms")
+	if hdr == "" {
+		t.Fatalf("a held response published no time-to-first-byte")
+	}
+	if ms, err := strconv.ParseFloat(hdr, 64); err != nil || ms <= 0 {
+		t.Errorf("X-Rooter-Ttft-Ms = %q, want a positive number of milliseconds", hdr)
+	}
+	// The header and the object the same client also receives must be the same
+	// number, or a consumer has to guess which one the other agrees with.
+	res2, out2 := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "ttft-b"))
+	var doc struct {
+		Rooter struct {
+			TTFTMs float64 `json:"ttft_ms"`
+		} `json:"rooter"`
+	}
+	if err := json.Unmarshal([]byte(out2), &doc); err != nil {
+		t.Fatal(err)
+	}
+	hdr2 := res2.Header.Get("X-Rooter-Ttft-Ms")
+	ms2, _ := strconv.ParseFloat(hdr2, 64)
+	if doc.Rooter.TTFTMs != ms2 {
+		t.Errorf("header says %v ms and the body object says %v ms", ms2, doc.Rooter.TTFTMs)
+	}
+
+	req := withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","stream":true,"messages":[{"role":"user","content":"x"}]}`), "ttft-c")
+	req.URL.Scheme, req.URL.Host = "http", e.addr()
+	sres, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, sres.Body)
+	sres.Body.Close()
+	if got := sres.Header.Get("X-Rooter-Ttft-Ms"); got != "" {
+		t.Errorf("a stream claimed a time-to-first-byte of %q that rooter cannot measure", got)
+	}
+}
