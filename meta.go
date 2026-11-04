@@ -108,6 +108,11 @@ type callRecord struct {
 	// prompt length by construction; the flag is for auditing, not for a different
 	// formula.
 	PromptTokensDerived bool `json:"prompt_tokens_derived,omitempty"`
+	// RunnerPromptNIncludesCache records that this backend's `prompt_n` counted the
+	// cached prefix inside the prompt, so rooter subtracted it to get the work done.
+	// It is an audit flag for a normalisation, not a measurement: a reader who wants
+	// the runner's raw number can recover it by adding cached_tokens back.
+	RunnerPromptNIncludesCache bool `json:"runner_prompt_n_includes_cache,omitempty"`
 	// PromptTokensComputed is what the runner actually evaluated this call, which
 	// llama.cpp calls prompt_n and is NOT the prompt length: it is the prompt minus
 	// whatever it served from the KV cache. On a live strata call the prompt was 54
@@ -220,13 +225,48 @@ func (c *callRecord) absorb(doc *timingsDoc) {
 	} else if t.CachedN != nil {
 		c.CachedTokens = t.CachedN
 	}
-	// prompt_n is the work done, not the prompt size. It becomes its own field, and
-	// the prompt total is reconstructed from it plus the cache when the runner did
-	// not report a usage block - which is what a plain llama.cpp /completion does.
+	// `prompt_n` does not mean the same thing on both runners, and the difference is
+	// not cosmetic - it is a factor of a hundred in prefill_tok_s on a warm cache.
+	//
+	// Taken live off the network on 2026-11-04, same field name, two backends:
+	//
+	//   strata  prompt_n=44    cached=95545 prompt_ms=560.5    prompt_per_second=78.5
+	//           44 / 0.5605s    = 78.5   matches what it states
+	//   sushi   prompt_n=49161 cached=48726 prompt_ms=1923.964 prompt_per_second=226.096
+	//           49161 / 1.924s  = 25552  nothing like what it states
+	//           435 / 1.924s    = 226.1  exactly what it states
+	//
+	// So strata's prompt_n is the work done and sushi's is the prompt size with the
+	// cached prefix still inside it. Neither is wrong; they are two builds of llama.cpp
+	// with two conventions and no field name to tell them apart.
+	//
+	// The runner reveals which one it is by doing its own arithmetic in front of us:
+	// it publishes a throughput, and only one of prompt_n/prompt_ms or
+	// (prompt_n-cached)/prompt_ms reproduces it. Rooter divides the same way the runner
+	// did, which is the only way both backends can share a column.
 	c.PromptTokensComputed = t.PromptN
-	if c.PromptTokens == nil && t.PromptN != nil {
-		total := *t.PromptN
-		if c.CachedTokens != nil {
+	if t.PromptN != nil && c.CachedTokens != nil && *c.CachedTokens > 0 && *c.CachedTokens <= *t.PromptN &&
+		t.PromptMS != nil && *t.PromptMS > 0 && t.PromptPerSecond != nil {
+		overFull := float64(*t.PromptN) / (*t.PromptMS / 1000)
+		overWork := float64(*t.PromptN-*c.CachedTokens) / (*t.PromptMS / 1000)
+		nearFull := nearlyEqual(overFull, *t.PromptPerSecond)
+		nearWork := nearlyEqual(overWork, *t.PromptPerSecond)
+		if nearWork && !nearFull {
+			// This runner's prompt_n still contains the cached prefix.
+			work := *t.PromptN - *c.CachedTokens
+			c.PromptTokensComputed = &work
+			c.RunnerPromptNIncludesCache = true
+			c.markRunnerPromptNIncludesCache()
+		}
+	}
+	if c.PromptTokens == nil && c.PromptTokensComputed != nil {
+		// Reconstruct the prompt length from whichever convention this runner used.
+		// Under the inflated convention prompt_n already WAS the prompt length; under
+		// the work convention it is the part that was not already in the KV cache.
+		total := *c.PromptTokensComputed
+		if c.RunnerPromptNIncludesCache {
+			total = *t.PromptN
+		} else if c.CachedTokens != nil {
 			total += *c.CachedTokens
 		}
 		c.PromptTokens = &total
@@ -335,6 +375,37 @@ func injectRooterObject(body []byte, rec any) ([]byte, bool) {
 // headerWriter sets rooter's headers. Every one of these is known before the
 // response starts, which is exactly why they are headers and not body fields.
 // roundMs is the single place a duration becomes a number a client reads.
+// nearlyEqual compares two rates the way a human reading a footer would: close
+// enough that the two agree, with room for the rounding a runner applies before it
+// prints its own number.
+func nearlyEqual(a, b float64) bool {
+	if a == b {
+		return true
+	}
+	tolerance := 0.02
+	if larger := math.Max(math.Abs(a), math.Abs(b)); larger > tolerance {
+		tolerance = larger * 0.02
+	}
+	return math.Abs(a-b) <= tolerance
+}
+
+// markRunnerPromptNIncludesCache records the normalisation in `extra` as well as on
+// the row, so whichever surface a reader is looking at tells them what happened.
+func (c *callRecord) markRunnerPromptNIncludesCache() {
+	if c.Extra == nil {
+		c.Extra = json.RawMessage(`{"runner_prompt_n_includes_cache":true}`)
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(c.Extra, &m); err != nil || m == nil {
+		return
+	}
+	m["runner_prompt_n_includes_cache"] = true
+	if b, err := json.Marshal(m); err == nil {
+		c.Extra = b
+	}
+}
+
 func roundMs(d time.Duration) float64 {
 	return math.Round(float64(d)/float64(time.Millisecond)*1000) / 1000
 }

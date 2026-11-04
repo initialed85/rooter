@@ -250,15 +250,38 @@ different times:
   recoverable.
 
 `prompt_tokens` is the prompt length. `prompt_tokens_computed` is what the runner
-actually evaluated, which on llama.cpp is the prompt minus whatever it served from
-the KV cache: a 54-token prompt with 49 cached reports `prompt_n` 5. Confusing the
-two makes a cache hit look like a tiny prompt and pushes `cache_hit_rate` above 1.
+actually evaluated: the prompt minus whatever it served from the KV cache.
+Confusing the two makes a cache hit look like a tiny prompt, pushes `cache_hit_rate`
+above 1, and prices a warm prefill at a speed nobody achieved.
+
+**`prompt_n` does not mean the same thing on both of our runners.** These are two
+live payloads of the same field name, taken from `/rooter/events` on 2026-11-04:
+
+| backend   | `prompt_n` | cached   | `prompt_ms` | states `prompt_per_second` | work done |
+|-----------|-----------:|---------:|------------:|---------------------------:|----------:|
+| strata    |         44 |   95,545 |       560.5 |                       78.5 |        44 |
+| sushi     |     49,161 |   48,726 |    1,923.96 |                  226.096 |       435 |
+
+`44 / 0.5605s` is 78.5, so strata's `prompt_n` is already the work done. For sushi,
+`49161 / 1.924s` is 25,552 tok/s — nothing it ever said — while `435 / 1.924s` is
+226.096 to the digit it printed. Sushi's `prompt_n` is the **prompt length with the
+cached prefix still inside it**.
+
+Neither build is wrong and neither is going to be renamed, so rooter decides which
+convention it is dealing with from the runner's own arithmetic: it publishes a
+throughput, and only one of `prompt_n / prompt_ms` or
+`(prompt_n - cached) / prompt_ms` reproduces it. Rooter divides the same way the
+runner did, which is the only way both backends can share a column. When it
+subtracts, the row carries `runner_prompt_n_includes_cache: true` — and the same key
+in `extra` — because a normalisation a reader cannot see is a number they are
+forced to trust. If you want the runner's raw figure back, add `cached_tokens` on.
 
 They are not two spellings of one number, and `prompt_tokens` is not always a
 measurement. It is read from `usage.prompt_tokens` when the runner sends a usage
 block. When it does not - which is what a plain llama.cpp `/completion` does -
-rooter reconstructs it as `prompt_tokens_computed + cached_tokens` and marks the
-row `prompt_tokens_derived: true`. Both are the full prompt length by construction,
+rooter reconstructs it from the work done plus the cache, or takes it straight from
+`prompt_n` when that was already the full prompt, and marks the row
+`prompt_tokens_derived: true`. Both are the full prompt length by construction,
 and `cache_hit_rate` is refused rather than corrected when the counts contradict
 each other, so either way it is a safe denominator; the flag exists because a
 reader who cannot tell a read value from a reconstructed one is trusting arithmetic
