@@ -39,6 +39,11 @@ const (
 	hdrWaitMs    = "X-Rooter-Wait-Ms"
 	hdrStreamed  = "X-Rooter-Streamed"
 	hdrTtftMs    = "X-Rooter-Ttft-Ms"
+
+	hdrCompletionTokens = "X-Rooter-Completion-Tokens"
+	hdrPrefillTokS      = "X-Rooter-Prefill-Tok-S"
+	hdrDecodeTokS       = "X-Rooter-Decode-Tok-S"
+	hdrCacheHitRate     = "X-Rooter-Cache-Hit-Rate"
 )
 
 // callRecord is one proxied exchange, as rooter saw it.
@@ -311,6 +316,15 @@ func roundMs(d time.Duration) float64 {
 	return math.Round(float64(d)/float64(time.Millisecond)*1000) / 1000
 }
 
+// setNumberHeader publishes an optional measurement. Absent means "nobody told us",
+// which is a different claim from a header that says 0.
+func setNumberHeader[T int | float64](h http.Header, name string, value *T) {
+	if value == nil {
+		return
+	}
+	h.Set(name, strconv.FormatFloat(float64(*value), 'f', -1, 64))
+}
+
 func setMetaHeaders(h http.Header, rec *callRecord) {
 	h.Set(hdrRequestID, rec.ID)
 	h.Set(hdrBackend, rec.Backend)
@@ -439,8 +453,17 @@ func (r *Router) finishRecord(w *replyWriter, rec *callRecord, res *attempt, b *
 		// stream's first byte and its headers are the same instant. Set it from the
 		// record rather than the writer so the header, the body object and the
 		// event ring cannot disagree about what the number means.
-		if w.buffering && rec.TTFTMs > 0 {
-			w.Header().Set(hdrTtftMs, strconv.FormatFloat(rec.TTFTMs, 'f', -1, 64))
+		if w.buffering {
+			if rec.TTFTMs > 0 {
+				w.Header().Set(hdrTtftMs, strconv.FormatFloat(rec.TTFTMs, 'f', -1, 64))
+			}
+			// The rest of what the runner said, as headers as well as body fields.
+			// A footer wants these while it is drawing, and a client that only ever
+			// looks at headers should not be locked out of the runner's own numbers.
+			setNumberHeader(w.Header(), hdrCompletionTokens, rec.CompletionTokens)
+			setNumberHeader(w.Header(), hdrPrefillTokS, rec.PrefillTokS)
+			setNumberHeader(w.Header(), hdrDecodeTokS, rec.DecodeTokS)
+			setNumberHeader(w.Header(), hdrCacheHitRate, rec.CacheHitRate)
 		}
 		// Abandoned streams have no tail worth reading, and that is the point:
 		// the usage and timing fields stay null rather than reading as zero, so

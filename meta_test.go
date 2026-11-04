@@ -608,3 +608,87 @@ func deref[T any](p *T) any {
 	}
 	return *p
 }
+
+// A client that only reads headers should not be locked out of the runner's own
+// numbers, and a measurement nobody made must not arrive dressed as a zero.
+func TestRunnerMeasurementsArePublishedAsHeaders(t *testing.T) {
+	srv := fakeTimingsServer(t)
+	e := newEnv(t, []string{"strata=" + srv.URL}, nil)
+	e.pool.CheckAll()
+	res, _ := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "mh"))
+	for name, want := range map[string]string{
+		"X-Rooter-Completion-Tokens": "8",
+		"X-Rooter-Prefill-Tok-S":     "27",
+		"X-Rooter-Decode-Tok-S":      "48.2",
+		"X-Rooter-Cache-Hit-Rate":    "0.9074074074074074",
+	} {
+		if got := res.Header.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// An abandoned stream has no measurements to publish, and publishing nothing is
+// the difference between "no data" and "the model produced nothing".
+func TestAbandonedCallPublishesNoMeasurementHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			io.WriteString(w, "ok")
+			return
+		case "/models":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"object":"list","data":[{"id":"qwen-model"}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	e := newEnv(t, []string{"strata=" + srv.URL}, nil)
+	e.pool.CheckAll()
+
+	req := withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","stream":true,"messages":[{"role":"user","content":"x"}]}`), "mh-abandon")
+	req.URL.Scheme, req.URL.Host = "http", e.addr()
+	res, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close() // hang up before the tail, which is the whole point
+	for _, name := range []string{"X-Rooter-Completion-Tokens", "X-Rooter-Decode-Tok-S", "X-Rooter-Cache-Hit-Rate"} {
+		if got := res.Header.Get(name); got != "" {
+			t.Errorf("%s = %q on a call that reported nothing", name, got)
+		}
+	}
+}
+
+// fakeTimingsServer replays the numbers a live strata call actually produced:
+// a 54-token prompt, 49 of it served from the KV cache, 5 evaluated.
+func fakeTimingsServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
+	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[{"id":"qwen-model"}]}`)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"chatcmpl-fake","created":1793761307,"model":"qwen-model",`+
+			`"choices":[{"index":0,"message":{"content":"hi"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":54,"completion_tokens":8,"total_tokens":62,`+
+			`"prompt_tokens_details":{"cached_tokens":49}},`+
+			`"timings":{"prompt_n":5,"prompt_ms":185.2,"prompt_per_second":27,"predicted_n":8,`+
+			`"predicted_ms":165.9,"predicted_per_second":48.2,"cache_n":49}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}

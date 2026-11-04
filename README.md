@@ -229,7 +229,9 @@ different times:
   a client rendering a footer while the tokens are still arriving can have them
   now. `X-Rooter-Model` is the *routing decision*: for `auto` it is `auto`, because
   rooter genuinely does not know which model the box will pick until it answers.
-- `X-Rooter-Ttft-Ms` and a `rooter` object, on **non-streaming JSON bodies only**.
+- `X-Rooter-Ttft-Ms`, `X-Rooter-Completion-Tokens`, `X-Rooter-Prefill-Tok-S`,
+  `X-Rooter-Decode-Tok-S`, `X-Rooter-Cache-Hit-Rate` and a `rooter` object, on
+  **non-streaming JSON bodies only**.
   A held body is the one case where a header can still carry a number measured
   during the response, and it is the one body rooter can safely extend. The object
   carries the runner's own per-token numbers, normalised: both boxes report
