@@ -41,7 +41,13 @@ const (
 
 // callRecord is one proxied exchange, as rooter saw it.
 type callRecord struct {
-	ID         string `json:"id"`
+	ID string `json:"id"`
+	// UpstreamID is the chat completion id the runner generated. It is the join
+	// key to a runner's own per-request detail, and the reason it lives here
+	// rather than being left to the client: a runner's request log is keyed by its
+	// own id, which rooter sees in the response body and a client has no way to
+	// attribute back to a routed call.
+	UpstreamID string `json:"upstream_id,omitempty"`
 	TS         string `json:"ts"`
 	Path       string `json:"path"`
 	Method     string `json:"method"`
@@ -89,6 +95,7 @@ type callRecord struct {
 // OpenAI-shaped usage block and llama.cpp's timings block are read from one
 // parse, and the two spellings of the cache field are folded together.
 type timingsDoc struct {
+	ID      string          `json:"id"`
 	Model   string          `json:"model"`
 	Timings json.RawMessage `json:"timings"`
 	Usage   struct {
@@ -120,6 +127,9 @@ type timingsRaw struct {
 // non-streaming body and once per SSE data line for a stream, which is how the
 // final chunk's timings end up in the same place a plain response's do.
 func (c *callRecord) absorb(doc *timingsDoc) {
+	if c.UpstreamID == "" && doc.ID != "" {
+		c.UpstreamID = doc.ID
+	}
 	if doc.Model != "" && doc.Model != "auto" && doc.Model != "default" {
 		c.Model = doc.Model
 	}

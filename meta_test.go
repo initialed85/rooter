@@ -413,3 +413,48 @@ func TestTTFTIsMeasuredNotInvented(t *testing.T) {
 	}
 	time.Sleep(5 * time.Millisecond)
 }
+
+// The join key to a runner's own per-request detail has to be the id the runner
+// generated, not rooter's, or a query cannot line the two up.
+func TestUpstreamIDIsTheJoinKey(t *testing.T) {
+	s := richFake(t, "strata", "qwen-model")
+	e := newEnv(t, []string{"strata=" + s.URL}, nil)
+	e.pool.CheckAll()
+	_, out := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "join"))
+	var doc struct {
+		Rooter struct {
+			ID         string `json:"id"`
+			UpstreamID string `json:"upstream_id"`
+		} `json:"rooter"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Rooter.UpstreamID != "c1" {
+		t.Errorf("upstream_id = %q, want the runner's own id", doc.Rooter.UpstreamID)
+	}
+	if doc.Rooter.ID == doc.Rooter.UpstreamID {
+		t.Errorf("rooter's id and the runner's id are the same value: %q", doc.Rooter.ID)
+	}
+	// A stream's id arrives in the first chunk, so it is captured the same way.
+	req := withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","stream":true,"messages":[{"role":"user","content":"x"}]}`), "join2")
+	req.URL.Scheme, req.URL.Host = "http", e.addr()
+	res, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+	recs, _, _ := e.router.events.since(0, 64)
+	var found bool
+	for _, rec := range recs {
+		if rec.Stream && rec.UpstreamID == "c1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a streamed call did not capture the runner's id")
+	}
+}
