@@ -253,6 +253,17 @@ the usage and timing fields `null` on an abandoned call rather than zero, which 
 the honest answer: a generation the client hung up on did not use no tokens, it
 reported none.
 
+**`ttft_ms` means time to the first upstream byte, not time to the first word.** On a
+held body those are the same instant. On a stream they are not, and the gap is not
+small: llama.cpp opens every stream with a chunk carrying `content: ""`, so rooter
+sees a first byte 40-60ms after the upstream answers while the user waits seconds for
+language - measured live at 0.00s for the empty delta and 6.09s for the first token on
+one busy box, because llama.cpp queues generations internally after its HTTP response
+has already begun streaming. Anything graphing `ttft_ms` from `/rooter/events` is
+therefore graphing *how soon the runner started replying*, which is a useful saturation
+signal and a misleading responsiveness one. A client that wants time-to-first-word on
+a stream has to measure it itself, against the first chunk carrying text.
+
 `-no-meta` turns all of this off; `-meta-tail 0` keeps the headers and stops rooter
 reading response bodies at all.
 
