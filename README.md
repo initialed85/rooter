@@ -45,7 +45,13 @@ that have free capacity.
   (`repo/GGUF:UD-Q6_K_XL`) is folded away, since `/models` reports the base id.
   If nobody claims the model the request is a `404`; while any backend's list is
   still unknown or empty it does not constrain the choice, so llama.cpp's
-  `default` and a cold router keep working.
+  `default` and a cold router keep working. A backend already known to be *down*
+  does not count towards that leniency: it was never going to serve the request,
+  so the only thing its unread inventory could accomplish is letting a live box
+  answer a model it does not list. Note too that rooter reads a body only when it
+  is JSON: a `curl -d` without `-H 'Content-Type: application/json'` arrives as
+  form-encoded, the model is invisible, and the request is routed as if it had
+  asked for nothing.
 - **`auto` is the meta model** — the model names `auto` and `default` are not a
   claim about weights, they mean "give me a GPU": the model filter is skipped,
   a fresh session goes to the freest healthy backend, and it is then sticky like
@@ -67,6 +73,14 @@ that have free capacity.
 - **Retries** — if a backend dies *before* sending a single response byte, the
   request is replayed onto another one. Once bytes have reached the client it
   cannot retry, so it lets the failure through.
+- **A box you named, that is down, is an outage** — `strata`, `icarus` and any
+  name retired with `-renamed` are pins rather than preferences, so when the box
+  they point at is unhealthy rooter answers `503` (with `Retry-After: 1`) saying
+  which box and how long it has been failing, instead of the `404` it reserves for
+  a model nobody serves. A `404` there reads as "your configuration names something
+  that does not exist", which is a lie: the configuration is fine and the machine
+  is not. Asking for a real model nobody lists is still a `404`, so a mistyped id
+  does not become a client retrying a mistake forever.
 - **Front-door auth is optional** — with `-api-key`, every request must present
   that key or it is a `401` before a backend is chosen, a slot is taken or a body
   is read. Without it rooter is open to whoever can reach the socket. See
@@ -234,6 +248,25 @@ With no `-api-key` the front door is open, and rooter says so at startup: an
 address that is not loopback logs a `WARNING`. That is fine on a LAN you own and
 is the historical default; it is not fine on a port somebody else can route to.
 
+### When a box goes down
+
+An outage should be visible in the pod log without anyone asking. With
+`-health-interval` in force (default 15s) rooter says:
+
+```text
+backend icarus unhealthy: dial tcp 192.168.137.111:8088: connect: connection refused
+backend icarus still unhealthy (10 consecutive checks, down 2m15s): dial tcp ...
+backend icarus still unhealthy (20 consecutive checks, down 5m0s): dial tcp ...
+backend icarus healthy again (after 21 failed check(s), down 5m15s)
+```
+
+The first failure is always logged; a box that stays down then repeats on a fixed
+cadence (`healthLogEvery`, every tenth probe) so a long outage is still evidence
+without becoming four lines a minute, and the recovery line carries the length of
+the outage, since a box coming back used to leave no trace of how long it had been
+gone. `errors_total` deliberately does not move for those repeated probes — see
+[Looking at it](#looking-at-it).
+
 ### Looking at it
 
 Everything under `/rooter/` belongs to rooter; every other path is proxied. If
@@ -242,14 +275,26 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied. If
 - `GET /rooter` — index, including whether the front door is keyed
 - `GET /rooter/stats` — JSON: per-backend health/busy/slots/models, queue,
   denial and status counters, session hit/miss/rebind totals
-- `GET /rooter/backends`, `GET /rooter/sessions` — the same, split up
+- `GET /rooter/backends`, `GET /rooter/sessions` — the same, split up. A backend
+  entry carries `healthFails` (consecutive failed probes, reset by a passing one)
+  and `downSince` (when the current run of failures began), and `checked` moves on
+  a failed probe as well as a passing one, because "last checked a moment ago, and
+  it failed" is the useful reading — a frozen `checked` looks identical to "nobody
+  is polling this box".
 - `GET /rooter/metrics` — Prometheus gauges and counters, plus per-`(backend,
   model)` families: `rooter_model_duration_seconds`, `_ttft_seconds`,
   `_prefill_seconds`, `_decode_seconds` histograms, `_requests_total`,
   `_errors_total`, `_aborted_total`, `_tokens_total{kind=prompt|completion|cached}`
   counters and a `_cache_hit_ratio` gauge. Labels are always exactly `backend` and
   `model`; session keys are deliberately never a label, because a per-session
-  cardinality on a histogram would blow up every series.
+  cardinality on a histogram would blow up every series. Availability sits on the
+  per-backend families: `rooter_backend_health_fails` (consecutive failed probes)
+  and `rooter_backend_down_seconds` (how long this backend has been failing its
+  probes, which is a duration rather than a timestamp so a dashboard can threshold
+  it without a clock to compare against). `rooter_backend_errors_total` still means
+  failed *round trips*, and moves on the flip into an outage: counting every probe
+  of a box that stays down would grow it four times a minute while nobody is asking
+  anything of that box.
 - `GET /rooter/events?cursor=<seq>&limit=<n>` — the finished calls the ring still
   holds, oldest first, as the same records the log line and the metrics are built
   from. The ring is bounded (`-event-ring`, default 2048) and drops the oldest half

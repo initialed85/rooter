@@ -2,3 +2,5 @@
 /rooter.exe
 *.log
 tmp/
+.pi/auto-resume.json
+.pi/schedule/locks

@@ -27,10 +27,16 @@ type Backend struct {
 	ModelIDs     []string        // same ids in /models document order, which is meaningful
 	DefaultModel string          // ModelIDs[0]: what this box is actually serving
 	Checked      time.Time
-	LastUsed     time.Time
-	Requests     int64
-	Errors       int64
-	TotalWait    time.Duration
+	// HealthFails counts consecutive failed health probes and DownSince is when the
+	// streak began. Without them a box that stays down is invisible: `checked` was
+	// only ever advanced by a probe that passed, so during a live outage it sat still
+	// and looked like a backend nobody was polling.
+	HealthFails int
+	DownSince   time.Time
+	LastUsed    time.Time
+	Requests    int64
+	Errors      int64
+	TotalWait   time.Duration
 }
 
 func (b *Backend) busy() int { return len(b.sem) }
@@ -59,7 +65,7 @@ func (b *Backend) MarshalJSON() ([]byte, error) {
 		models = append(models, m)
 	}
 	sortStrings(models)
-	return json.Marshal(map[string]any{
+	out := map[string]any{
 		"name":        b.Name,
 		"url":         b.Base.String(),
 		"concurrency": b.Concurrency,
@@ -71,7 +77,16 @@ func (b *Backend) MarshalJSON() ([]byte, error) {
 		"errors":      b.Errors,
 		"totalWait":   b.TotalWait.String(),
 		"checked":     b.Checked,
-	})
+	}
+	// Only when there is an outage to describe: a zero time reads as a date nobody
+	// chose and a zero count reads like a bug in the thing reporting it.
+	if b.HealthFails > 0 {
+		out["healthFails"] = b.HealthFails
+	}
+	if !b.DownSince.IsZero() {
+		out["downSince"] = b.DownSince
+	}
+	return json.Marshal(out)
 }
 
 // parseBackends turns -backend flag values into Backends.

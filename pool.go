@@ -18,6 +18,7 @@ var (
 	errBusy        = errors.New("all candidates busy")
 	errNoCandidate = errors.New("no backend can serve this request")
 	errNoModel     = errors.New("no backend serves the requested model")
+	errBackendDown = errors.New("the backend named by the request is unhealthy")
 	errMaxWait     = errors.New("timed out waiting for a free slot")
 )
 
@@ -104,12 +105,25 @@ func (p *Pool) MetaNames() []string {
 	return out
 }
 
+// Backends returns the live backend values. The slice is a copy; the Backends
+// themselves are still guarded by Pool.mu, so a caller that wants to *read* their
+// state should go through Stats or SnapshotJSON rather than marshalling these.
 func (p *Pool) Backends() []*Backend {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := make([]*Backend, len(p.backends))
 	copy(out, p.backends)
 	return out
+}
+
+// SnapshotJSON renders every backend with Pool.mu held for the whole render.
+// Handing out *Backend values and letting a caller marshal them reads the mutable
+// fields Check() writes from outside the lock, which is a race the admin endpoint
+// has no need for.
+func (p *Pool) SnapshotJSON() ([]byte, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return json.MarshalIndent(p.backends, "", "  ")
 }
 
 // Lookup returns a backend by its configured name, or by a name that was retired
@@ -223,6 +237,7 @@ func (p *Pool) MarkUnhealthy(b *Backend, why string) {
 type SelectOpts struct {
 	Prefer     *Backend            // sticky backend for this session, may be nil
 	Eligible   func(*Backend) bool // model support / extras; nil == everyone
+	Model      string              // what the client asked for, verbatim; may be a backend name
 	MaxWait    time.Duration       // 0 == block forever
 	Grace      time.Duration       // how long to keep waiting on an unusable sticky backend
 	SpillAfter time.Duration       // after this much waiting, go elsewhere if possible (0 == never)
@@ -247,7 +262,7 @@ func (p *Pool) Acquire(ctx context.Context, o SelectOpts) (*Backend, Outcome, er
 	if !o.NeedSlot {
 		b := p.pick(ctx, o, &lostSticky)
 		if b == nil {
-			return nil, out, p.noCandidateErr(o.Eligible)
+			return nil, out, p.noCandidateErr(o)
 		}
 		out.Backend = b
 		out.Rebound = o.Prefer != nil && b != o.Prefer
@@ -269,8 +284,11 @@ func (p *Pool) Acquire(ctx context.Context, o SelectOpts) (*Backend, Outcome, er
 			p.touch(b, out.Waited)
 			return b, out, nil
 		}
-		if errors.Is(err, errNoCandidate) || errors.Is(err, errNoModel) {
-			// Nothing to wait for: no backend could ever take this request.
+		if errors.Is(err, errNoCandidate) || errors.Is(err, errNoModel) || errors.Is(err, errBackendDown) {
+			// Nothing to wait for: no backend could ever take this request. A named box
+			// being down belongs here too - queueing for twenty seconds at the front of
+			// a router does not make a machine that is refusing connections come back,
+			// and it makes the outage the client already cannot see even later.
 			out.Waited = time.Since(start)
 			return nil, out, err
 		}
@@ -308,7 +326,7 @@ func (p *Pool) try(o SelectOpts, lostSticky *time.Time) (*Backend, error) {
 		// "nothing is healthy" and "nothing serves this model" look the same here
 		// but are not the same failure: the first is a 503 worth retrying, the
 		// second is a 404 that will never succeed.
-		return nil, p.noCandidateErrLocked(o.Eligible)
+		return nil, p.noCandidateErrLocked(o)
 	}
 
 	// 1. sticky: keep the prefix cache warm on the backend we used before - but
@@ -384,20 +402,63 @@ func (p *Pool) pick(ctx context.Context, o SelectOpts, lostSticky *time.Time) *B
 
 // noCandidateErr says *why* there are no candidates, so the caller can answer
 // 503 (try again) or 404 (that model does not exist here).
-func (p *Pool) noCandidateErr(filter func(*Backend) bool) error {
+func (p *Pool) noCandidateErr(o SelectOpts) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.noCandidateErrLocked(filter)
+	return p.noCandidateErrLocked(o)
 }
 
 // noCandidateErrLocked is the caller-must-hold-p.mu form; try() reaches for it
 // while already holding the lock, and taking it twice would self-deadlock.
-func (p *Pool) noCandidateErrLocked(filter func(*Backend) bool) error {
-	if filter != nil && p.healthyCountLocked() > 0 {
+func (p *Pool) noCandidateErrLocked(o SelectOpts) error {
+	// A backend name is a legitimate thing to ask for, and it is a pin to one
+	// machine. When that machine is the only reason there are no candidates, saying
+	// "no backend serves model X" is a 404 about a model nobody asked about: the
+	// name is not wrong, the box is down, and 503 with a Retry-After is the truth a
+	// client can act on. -renamed targets resolve here too, so a retired name reads
+	// as what it means now rather than as an unknown model.
+	if b := p.byNameLocked(o.Model); b != nil && !b.Healthy {
+		return &backendDownErr{
+			asked:   strings.TrimSpace(o.Model),
+			backend: b.Name,
+			fails:   b.HealthFails,
+			down:    b.DownSince,
+		}
+	}
+	if o.Eligible != nil && p.healthyCountLocked() > 0 {
 		return errNoModel
 	}
 	return errNoCandidate
 }
+
+// backendDownErr is a request that named a box rooter knows about, where that box is
+// the reason the request cannot be served. asked and backend differ when the client
+// used a name retired with -renamed.
+type backendDownErr struct {
+	asked   string
+	backend string
+	fails   int
+	down    time.Time
+}
+
+func (e *backendDownErr) Error() string {
+	who := fmt.Sprintf("backend %q", e.backend)
+	if e.asked != "" && e.asked != e.backend {
+		who = fmt.Sprintf("backend %q (asked for as %q)", e.backend, e.asked)
+	}
+	switch {
+	case e.fails > 0 && !e.down.IsZero():
+		return fmt.Sprintf("%s is unhealthy: %d failed health checks since %s", who, e.fails, e.down.Format(time.RFC3339))
+	case e.fails > 0:
+		return fmt.Sprintf("%s is unhealthy: %d consecutive failed health checks", who, e.fails)
+	default:
+		// Marked unhealthy by a failed round trip rather than by a probe: rooter
+		// knows the box is not answering, but has not polled it since.
+		return fmt.Sprintf("%s is unhealthy", who)
+	}
+}
+
+func (e *backendDownErr) Unwrap() error { return errBackendDown }
 
 // inSet reports whether b is one of the candidates in list.
 func inSet(list []*Backend, b *Backend) bool {
@@ -575,6 +636,11 @@ func (p *Pool) Check(b *Backend) error {
 	}
 	b.Healthy = true
 	b.Checked = time.Now()
+	// A probe that passed ends any outage streak, which is what makes the failure
+	// counters below mean "how long has this box been down" rather than "how many
+	// times has anything ever gone wrong".
+	b.HealthFails = 0
+	b.DownSince = time.Time{}
 	p.notify()
 	p.mu.Unlock()
 	return nil
@@ -592,6 +658,56 @@ func (p *Pool) SetHealth(b *Backend, healthy bool) {
 	p.mu.Unlock()
 }
 
+// healthLogEvery is how many consecutive failed probes pass before rooter says
+// something again about a box that is staying down. The first failure is always
+// interesting; the fifth is the same news, and at a 15s interval a line every tenth
+// check is one every two and a half minutes - enough to see an outage persisting
+// without a wall of identical lines.
+const healthLogEvery = 10
+
+type checkFailure struct {
+	streak  int           // consecutive failed probes, including this one
+	down    time.Duration // how long the box has been failing
+	flipped bool          // healthy before this probe, unhealthy now
+	speak   bool          // worth a log line
+}
+
+// noteFailedProbe records the result of a failed health probe. Call with p.mu held.
+//
+// Checked advances whether the probe passed or failed, because it means "the last
+// time rooter looked". Leaving it frozen on failure is what makes a box that has been
+// refused for five minutes look like a box nobody is polling - which is exactly how
+// /rooter/backends read during a live outage.
+func (p *Pool) noteFailedProbeLocked(b *Backend) checkFailure {
+	now := time.Now()
+	out := checkFailure{flipped: b.Healthy}
+	if b.HealthFails == 0 {
+		b.DownSince = now
+	}
+	b.HealthFails++
+	b.Checked = now
+	b.Healthy = false
+	p.notify()
+	out.streak = b.HealthFails
+	out.down = now.Sub(b.DownSince)
+	out.speak = out.flipped || out.streak == 1 || out.streak%healthLogEvery == 0
+	return out
+}
+
+// probeState is what rooter believes about a backend at one instant, read as a unit
+// so a caller can compare it with what the next probe says.
+type probeState struct {
+	healthy   bool
+	fails     int
+	downSince time.Time
+}
+
+func (p *Pool) probeState(b *Backend) probeState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return probeState{healthy: b.Healthy, fails: b.HealthFails, downSince: b.DownSince}
+}
+
 func (p *Pool) CheckAll() {
 	var wg sync.WaitGroup
 	for _, b := range p.Backends() {
@@ -600,12 +716,12 @@ func (p *Pool) CheckAll() {
 			defer wg.Done()
 			if err := p.Check(b); err != nil {
 				p.mu.Lock()
-				first := b.Checked.IsZero()
-				b.Healthy = false
+				out := p.noteFailedProbeLocked(b)
 				b.Errors++
-				p.notify()
 				p.mu.Unlock()
-				p.log.Printf("backend %s %s: %v", b.Name, map[bool]string{true: "unreachable", false: "still unreachable"}[first], err)
+				if out.speak {
+					p.log.Printf("backend %s unreachable: %v", b.Name, err)
+				}
 			} else {
 				p.log.Printf("backend %s ok (%d slot(s), %s)", b.Name, b.Concurrency, p.modelSummary(b))
 			}
@@ -643,24 +759,43 @@ func (p *Pool) HealthLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			for _, b := range p.Backends() {
-				if err := p.Check(b); err != nil {
+				// Read what rooter currently believes *before* probing. Check() flips
+				// Healthy itself when a probe passes, so asking afterwards is how
+				// "healthy again" became a line that could never print: a box coming back
+				// from an outage said nothing at all.
+				before := p.probeState(b)
+				err := p.Check(b)
+				if err != nil {
 					p.mu.Lock()
-					if b.Healthy {
-						p.log.Printf("backend %s unhealthy: %v", b.Name, err)
-						b.Healthy = false
+					out := p.noteFailedProbeLocked(b)
+					// errors_total means failed round trips for a backend, and a probe is
+					// one; but counting every probe of a box that stays down would grow it
+					// four times a minute while nothing is being asked of that box, so it
+					// still moves only on the flip. HealthFails is the outage counter.
+					if out.flipped {
 						b.Errors++
-						p.notify()
 					}
 					p.mu.Unlock()
+					if out.speak {
+						if out.streak == 1 {
+							p.log.Printf("backend %s unhealthy: %v", b.Name, err)
+						} else {
+							p.log.Printf("backend %s still unhealthy (%d consecutive checks, down %s): %v",
+								b.Name, out.streak, out.down.Round(time.Second), err)
+						}
+					}
+					continue
+				}
+				if before.healthy {
+					continue // steady state: a passing probe is not news
+				}
+				// An outage should have a last line as well as a first one. Without it,
+				// a box that came back left no trace of how long it had been gone.
+				if before.fails > 0 && !before.downSince.IsZero() {
+					p.log.Printf("backend %s healthy again (after %d failed check(s), down %s)",
+						b.Name, before.fails, time.Since(before.downSince).Round(time.Second))
 				} else {
-					p.mu.Lock()
-					if !b.Healthy {
-						p.log.Printf("backend %s healthy again", b.Name)
-						b.Healthy = true
-						b.Checked = time.Now()
-						p.notify()
-					}
-					p.mu.Unlock()
+					p.log.Printf("backend %s healthy again", b.Name)
 				}
 			}
 		}
@@ -674,7 +809,9 @@ func (p *Pool) HealthLoop(ctx context.Context) {
 // Deliberately lenient: if no backend lists the model (llama.cpp reports
 // "default" while accepting anything) or a backend's list has not been read
 // yet, that backend stays eligible. A stale model list should cost one request,
-// not wedge the router.
+// not wedge the router. The one exception is a backend already known to be down:
+// it is not a candidate for the request in the first place, so the only thing its
+// unknown inventory can do is loosen the filter for the boxes that are up.
 func (p *Pool) ModelFilter(model string) func(*Backend) bool {
 	model = strings.TrimSpace(model)
 	// A meta model is a name the client made up on purpose ("default" built in,
@@ -699,8 +836,15 @@ func (p *Pool) ModelFilter(model string) func(*Backend) bool {
 	allowed := make(map[string]bool, len(p.backends))
 	for _, b := range p.backends {
 		if len(b.Models) == 0 {
-			unknownLists++
-			continue // never polled, or polled and reported nothing: no basis to exclude it
+			// Never polled, or polled and reported nothing: no basis to exclude it.
+			// But a box that has been proven down is not an excuse for the living ones:
+			// leaving its unknown inventory in the count would turn every mistyped model
+			// id in the fleet into a request a live box answers with whatever it happens
+			// to have loaded, which is the silent swap this filter exists to prevent.
+			if b.Healthy {
+				unknownLists++
+			}
+			continue
 		}
 		for id := range b.Models {
 			if normalizeModel(id) == want {

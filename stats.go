@@ -30,7 +30,11 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 	case "rooter/events":
 		r.eventsJSON(w, req)
 	case "rooter/backends":
-		b, _ := json.MarshalIndent(r.pool.Backends(), "", "  ")
+		b, err := r.pool.SnapshotJSON()
+		if err != nil {
+			errJSON(w, http.StatusInternalServerError, "backends: "+err.Error())
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(b)
 	case "rooter/sessions":
@@ -61,8 +65,15 @@ func (r *Router) adminIndex(w http.ResponseWriter) {
 			models = append(models, m)
 		}
 		sort.Strings(models)
-		fmt.Fprintf(w, "  %-16s %s  slots %d/%d  healthy=%v  models=%s\n",
-			b.Name, b.Base, b.busy(), b.Concurrency, b.Healthy, strings.Join(models, ","))
+		// A box that has been down for a while should say so here. Before this, the
+		// only sign of a sustained outage in this output was healthy=false and a
+		// `checked` timestamp that had stopped moving.
+		down := ""
+		if b.HealthFails > 0 {
+			down = fmt.Sprintf("  down %s (%d failed check(s))", time.Since(b.DownSince).Round(time.Second), b.HealthFails)
+		}
+		fmt.Fprintf(w, "  %-16s %s  slots %d/%d  healthy=%v  models=%s%s\n",
+			b.Name, b.Base, b.busy(), b.Concurrency, b.Healthy, strings.Join(models, ","), down)
 		r.pool.mu.Unlock()
 	}
 	if renamed := r.pool.RenamedNames(); len(renamed) > 0 {
@@ -140,7 +151,7 @@ func (p *Pool) Stats() []map[string]any {
 			models = append(models, m)
 		}
 		sort.Strings(models)
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"name":        b.Name,
 			"url":         b.Base.String(),
 			"busy":        b.busy(),
@@ -152,7 +163,17 @@ func (p *Pool) Stats() []map[string]any {
 			"waitTotal":   b.TotalWait.String(),
 			"lastUsed":    b.LastUsed,
 			"checked":     b.Checked,
-		})
+			// A zero streak is worth saying: it is how a reader can tell "this box has
+			// been passing" from "nobody has looked at this box".
+			"healthFails": b.HealthFails,
+		}
+		// downSince only exists during an outage. A zero time.Time is a date nobody
+		// chose, and printing one for every healthy backend reads like a bug in the
+		// thing doing the reporting.
+		if !b.DownSince.IsZero() {
+			entry["downSince"] = b.DownSince
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -196,6 +217,8 @@ func (r *Router) prometheus(w http.ResponseWriter) {
 	e("rooter_backend_healthy", "Whether the health check last passed", "gauge")
 	e("rooter_backend_requests_total", "Requests proxied to a backend", "counter")
 	e("rooter_backend_errors_total", "Failed round trips for a backend", "counter")
+	e("rooter_backend_health_fails", "Consecutive failed health probes for a backend (0 when a probe passes)", "gauge")
+	e("rooter_backend_down_seconds", "How long this backend has been failing its health probes", "gauge")
 	for _, b := range r.pool.Stats() {
 		l := fmt.Sprintf(`{backend="%s"}`, b["name"])
 		fmt.Fprintf(w, "rooter_backend_slots_busy%s %v\n", l, b["busy"])
@@ -207,6 +230,17 @@ func (r *Router) prometheus(w http.ResponseWriter) {
 		fmt.Fprintf(w, "rooter_backend_healthy%s %d\n", l, h)
 		fmt.Fprintf(w, "rooter_backend_requests_total%s %v\n", l, b["requests"])
 		fmt.Fprintf(w, "rooter_backend_errors_total%s %v\n", l, b["errors"])
+		fails, _ := b["healthFails"].(int)
+		fmt.Fprintf(w, "rooter_backend_health_fails%s %d\n", l, fails)
+		// down_seconds is deliberately a duration rather than a timestamp: "when did it
+		// break" needs a clock to compare against, "how long has it been broken" is the
+		// number a dashboard wants and an alert can threshold. Three decimals so a fresh
+		// outage does not round to zero and look like nothing is wrong.
+		down := 0.0
+		if ds, ok := b["downSince"].(time.Time); ok && !ds.IsZero() && h == 0 {
+			down = time.Since(ds).Seconds()
+		}
+		fmt.Fprintf(w, "rooter_backend_down_seconds%s %.3f\n", l, down)
 	}
 	// The per-model families are the point of the whole exercise: a box-level
 	// request count cannot tell you that one model is slow, or that the cache is

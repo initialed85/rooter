@@ -242,6 +242,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	opts := SelectOpts{
 		Prefer:     bound,
 		Eligible:   r.pool.ModelFilter(info.Model),
+		Model:      info.Model,
 		MaxWait:    r.cfg.MaxWait,
 		Grace:      r.cfg.StickyGrace,
 		SpillAfter: r.cfg.SpillAfter,
@@ -783,6 +784,10 @@ func statusForErr(err error) int {
 		// A model no backend claims will never succeed, whatever the client
 		// retries. llama.cpp would answer it with a different model, silently.
 		return http.StatusNotFound
+	case errors.Is(err, errBackendDown):
+		// The request named a box, and that box is not answering. Nothing about the
+		// name is wrong, so this is "try again", not "that model does not exist".
+		return http.StatusServiceUnavailable
 	case errors.Is(err, errMaxWait), errors.Is(err, errNoCandidate), errors.Is(err, errBusy):
 		return http.StatusServiceUnavailable
 	default:
@@ -806,6 +811,16 @@ func (r *Router) noBackend(w http.ResponseWriter, req *http.Request, info reques
 	code := statusForErr(err)
 	msg := "no backend available"
 	switch {
+	case errors.Is(err, errBackendDown):
+		// Named a box, box is down: say which box, and say it as an outage. A client
+		// reading a 404 here would conclude its configuration names a model that does
+		// not exist, which is the opposite of what happened.
+		var down *backendDownErr
+		if errors.As(err, &down) {
+			msg = down.Error()
+		} else {
+			msg = err.Error()
+		}
 	case errors.Is(err, errNoModel):
 		msg = fmt.Sprintf("no backend serves model %q", info.Model)
 	case errors.Is(err, errNoCandidate):
