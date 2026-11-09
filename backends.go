@@ -150,7 +150,7 @@ func parseBackend(spec string, defaultConcurrency int) (*Backend, error) {
 			return nil, fmt.Errorf("unexpected token %q in backend spec %q", p, spec)
 		}
 	}
-	// "sushi=http://host:8088/v1" - an unrecognised key whose value is a URL is
+	// "icarus=http://host:8088/v1" - an unrecognised key whose value is a URL is
 	// read as name=url. An explicit name= still wins.
 	if rawURL == "" {
 		keys := make([]string, 0, len(fields))
@@ -200,7 +200,7 @@ func parseBackend(spec string, defaultConcurrency int) (*Backend, error) {
 }
 
 // normalizeKey maps the accepted spec keys onto a canonical set, and keeps
-// unknown keys as-is so that "sushi=http://..." style can be detected.
+// unknown keys as-is so that "NAME=http://..." style can be detected.
 func normalizeKey(k string) string {
 	k = strings.ToLower(strings.TrimSpace(k))
 	switch k {
@@ -267,4 +267,61 @@ func unescape(s string) string {
 
 func sortStrings(s []string) {
 	sort.Strings(s)
+}
+
+// Renaming is a backend name that no longer names a box, plus the box it should
+// now resolve to.
+//
+// It exists because a name outlives the thing it named. models.json entries,
+// saved /model picks, bookmarks and rooter's own session bindings all keep saying
+// the old name long after the box has been renamed, and a router that has simply
+// forgotten it answers every one of them with a 404. That looks exactly like an
+// outage and is really a rename, which is the worst kind of outage to debug.
+//
+// The mapping is configuration, not source: rooter carries no fossil box names in
+// its code, and taking the flag away is what finally retires a name.
+type Renaming struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// parseRenamed reads -renamed 'old=new' specs against the backends that actually
+// exist. The checking matters more here than it does for -backend: a renamed name
+// that resolves to nothing is indistinguishable from a name nobody configured, so
+// a typo would fail as a mystery rather than as an error.
+func parseRenamed(specs []string, backends []*Backend) ([]Renaming, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	live := make(map[string]string, len(backends)) // lowercased -> the real name
+	for _, b := range backends {
+		live[strings.ToLower(strings.TrimSpace(b.Name))] = b.Name
+	}
+	out := make([]Renaming, 0, len(specs))
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+		i := strings.IndexByte(spec, '=')
+		if i <= 0 || i == len(spec)-1 {
+			return nil, fmt.Errorf("bad -renamed %q: want OLD=NEW", spec)
+		}
+		from, to := strings.TrimSpace(spec[:i]), strings.TrimSpace(spec[i+1:])
+		canon, ok := live[strings.ToLower(to)]
+		if !ok {
+			return nil, fmt.Errorf("-renamed %q: no backend named %q (known: %s)",
+				spec, to, strings.Join(backendNames(backends), ", "))
+		}
+		if _, taken := live[strings.ToLower(from)]; taken {
+			return nil, fmt.Errorf("-renamed %q: %q is a backend today, so it cannot also be a retired name", spec, from)
+		}
+		if seen[strings.ToLower(from)] {
+			return nil, fmt.Errorf("-renamed %q: %q is already renamed", spec, from)
+		}
+		seen[strings.ToLower(from)] = true
+		out = append(out, Renaming{From: from, To: canon})
+	}
+	return out, nil
 }

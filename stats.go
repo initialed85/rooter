@@ -65,6 +65,13 @@ func (r *Router) adminIndex(w http.ResponseWriter) {
 			b.Name, b.Base, b.busy(), b.Concurrency, b.Healthy, strings.Join(models, ","))
 		r.pool.mu.Unlock()
 	}
+	if renamed := r.pool.RenamedNames(); len(renamed) > 0 {
+		pairs := make([]string, 0, len(renamed))
+		for _, rn := range renamed {
+			pairs = append(pairs, fmt.Sprintf("%s -> %s", rn.From, rn.To))
+		}
+		fmt.Fprintf(w, "\nretired names still routed: %s\n", strings.Join(pairs, ", "))
+	}
 	fmt.Fprintf(w, "\nmeta models (any backend, least loaded, then sticky): %s\n", strings.Join(r.pool.MetaNames(), " "))
 	if r.cfg.SpillAfter > 0 {
 		fmt.Fprintf(w, "spill after %s waiting on a busy sticky backend\n", r.cfg.SpillAfter)
@@ -111,6 +118,7 @@ func (r *Router) Stats() map[string]any {
 	s["backends"] = r.pool.Stats()
 	s["slots"] = r.pool.SlotSummary()
 	s["metaModels"] = r.pool.MetaNames()
+	s["renamed"] = r.pool.RenamedNames()
 	if r.cfg.SpillAfter > 0 {
 		s["spillAfter"] = r.cfg.SpillAfter.String()
 	}

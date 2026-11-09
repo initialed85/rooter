@@ -76,11 +76,13 @@ func richFake(t *testing.T, name, model string) *httptest.Server {
 	return srv
 }
 
-// strata spells the cache field cache_n, sushi spells it cached_n. Neither is
-// wrong and neither is going to change, so the tests cover both and rooter
-// folds them into one place.
+// The two spellings this router has to survive: some llama.cpp builds report the
+// cache count as cache_n and some as cached_n. Neither is wrong, nothing in the
+// payload says which one is arriving, and our own two boxes used to disagree about
+// it. The fixtures carry the convention in their own names now, because the box that
+// taught us this is retired and the convention is not.
 func cacheKey(name string) string {
-	if strings.Contains(name, "sushi") {
+	if strings.Contains(name, "cachedn") {
 		return "cached_n"
 	}
 	return "cache_n"
@@ -98,8 +100,8 @@ func mustJSON(t *testing.T, v any) string {
 func jsonQuote(s string) string { b, _ := json.Marshal(s); return string(b) }
 
 func TestHeadersNameTheBackendAndModelOnEveryResponse(t *testing.T) {
-	s := richFake(t, "sushi", "sushi-model")
-	e := newEnv(t, []string{"sushi=" + s.URL}, nil)
+	s := richFake(t, "cachedn", "cachedn-model")
+	e := newEnv(t, []string{"cachedn=" + s.URL}, nil)
 	e.pool.CheckAll()
 
 	for _, tc := range []struct{ name, body string }{
@@ -116,7 +118,7 @@ func TestHeadersNameTheBackendAndModelOnEveryResponse(t *testing.T) {
 			// answered is the body object's job, which is exactly why there are
 			// two surfaces rather than one.
 			for h, want := range map[string]string{
-				"X-Rooter-Backend": "sushi",
+				"X-Rooter-Backend": "cachedn",
 				"X-Rooter-Model":   "auto",
 				"X-Rooter-Route":   "gen",
 			} {
@@ -206,9 +208,9 @@ func TestNonStreamingBodyCarriesTheRooterObject(t *testing.T) {
 }
 
 // Both cache spellings, one field.
-func TestSushiCacheSpellingFoldsIntoTheSameField(t *testing.T) {
-	s := richFake(t, "sushi", "sushi-model")
-	e := newEnv(t, []string{"sushi=" + s.URL}, nil)
+func TestCachedNSpellingFoldsIntoTheSameField(t *testing.T) {
+	s := richFake(t, "cachedn", "cachedn-model")
+	e := newEnv(t, []string{"cachedn=" + s.URL}, nil)
 	e.pool.CheckAll()
 	_, out := e.do(withSession(postJSON("/v1/chat/completions",
 		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "s"))
@@ -219,8 +221,8 @@ func TestSushiCacheSpellingFoldsIntoTheSameField(t *testing.T) {
 
 // A stream is the user's tokens arriving. Rooter must not touch those bytes.
 func TestStreamIsPassedThroughByteForByte(t *testing.T) {
-	s := richFake(t, "sushi", "sushi-model")
-	e := newEnv(t, []string{"sushi=" + s.URL}, nil)
+	s := richFake(t, "cachedn", "cachedn-model")
+	e := newEnv(t, []string{"cachedn=" + s.URL}, nil)
 	e.pool.CheckAll()
 
 	req := withSession(postJSON("/v1/chat/completions",
@@ -716,7 +718,7 @@ func TestFirstByteAndFirstWordAreSeparateMeasurements(t *testing.T) {
 		fl.Flush()
 		time.Sleep(gap)
 		// What a thinking model actually streams first is reasoning_content. This
-		// fixture is copied from a live sushi response rather than from the spec.
+		// fixture is copied from a live llama.cpp response rather than from the spec.
 		io.WriteString(w, `data: {"id":"c9","object":"chat.completion.chunk","model":"`+model+
 			`","choices":[{"index":0,"delta":{"reasoning_content":"one"},"finish_reason":null}],"usage":null}`+"\n\n")
 		fl.Flush()
@@ -777,7 +779,7 @@ func TestEmptyAndNullContentAreNotWords(t *testing.T) {
 		`data: {"choices":[{"delta":{"content":"x"}}]}`,
 		`data: {"choices":[{"delta":{"content":"{\"json\": true}"}}]}`,
 		`data: {"choices":[{"text":"x"}]}`,
-		// A thinking model says this first, and live is worse: a sushi response
+		// A thinking model says this first, and live is worse: a real response
 		// streamed twenty deltas as reasoning_content and its only content field was
 		// the empty opening one.
 		`data: {"choices":[{"delta":{"reasoning_content":"The"}}]}`,

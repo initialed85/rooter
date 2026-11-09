@@ -567,14 +567,16 @@ func (w *replyWriter) observe(p []byte) {
 // which is the most predictable bytes in the protocol.
 //
 // The scan tolerates whitespace because llama.cpp writes "key": "value" with a space
-// after the colon on one of the two boxes and not the other. A marker written as
-// `"content":"` matched one runner and silently missed the other, and the miss looked
-// exactly like a call that never said anything. This is the same lesson streamRequested
-// already learned about the request side.
+// after the colon on some builds and not on others - our two boxes used to disagree
+// about it, and today agree. A marker written as `"content":"` matched one runner and
+// silently missed the other, and the miss looked exactly like a call that never said
+// anything. This is the same lesson streamRequested already learned about the request
+// side: tolerate the shape, never assume which box is answering.
 //
 // reasoning_content is on the list because it is what a thinking model says first and
-// it is words the user watches. Live proof: a sushi response streamed twenty deltas as
-// reasoning_content and its only content field was the empty opening one.
+// it is words the user watches. Live proof: a thinking response on the retired sushi
+// box streamed twenty deltas as reasoning_content and its only content field was the
+// empty opening one.
 func firstContentOffset(p []byte) int {
 	for _, key := range []string{`"content"`, `"reasoning_content"`, `"text"`} {
 		needle := []byte(key)

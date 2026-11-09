@@ -25,7 +25,8 @@ type PoolOpts struct {
 	Poll           time.Duration // safety-net recheck while blocked
 	HealthInterval time.Duration
 	HealthTimeout  time.Duration
-	MetaModels     []string // model names that mean "whoever is freest", not a real model
+	MetaModels     []string   // model names that mean "whoever is freest", not a real model
+	Renamed        []Renaming // retired backend names that still resolve, to a backend that exists
 	Verbose        bool
 }
 
@@ -44,7 +45,9 @@ type Pool struct {
 	mu       sync.Mutex
 	backends []*Backend
 	byName   map[string]*Backend
-	release  chan struct{} // closed and replaced whenever a slot frees or state changes
+	renamed  map[string]string // lowercased retired name -> the live backend it now means
+	formers  []Renaming        // as configured, for the catalog and /rooter/stats
+	release  chan struct{}     // closed and replaced whenever a slot frees or state changes
 	opts     PoolOpts
 	meta     map[string]bool // normalized MetaModels, fixed at start
 	client   *http.Client
@@ -73,6 +76,15 @@ func NewPool(backends []*Backend, opts PoolOpts, client *http.Client, logger *lo
 		b.Healthy = true // optimistic until proven otherwise
 		p.byName[b.Name] = b
 	}
+	// Retired names are wired to live ones once, at start: nothing adds or removes
+	// them afterwards, so every read path can treat the map as fixed.
+	p.renamed = map[string]string{}
+	for _, rn := range opts.Renamed {
+		if b := p.byName[rn.To]; b != nil {
+			p.renamed[strings.ToLower(strings.TrimSpace(rn.From))] = b.Name
+		}
+	}
+	p.formers = append([]Renaming(nil), opts.Renamed...)
 	return p
 }
 
@@ -100,18 +112,49 @@ func (p *Pool) Backends() []*Backend {
 	return out
 }
 
-// Lookup returns a backend by its configured name.
+// Lookup returns a backend by its configured name, or by a name that was retired
+// in favour of one. Session bindings store a backend name, so a binding made
+// before a rename is read through here rather than being thrown away.
 func (p *Pool) Lookup(name string) *Backend {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.byName[name]
+	return p.byNameLocked(name)
 }
 
-// Alias resolves a requested model that is really a backend name. "sushi" is not
+// byNameLocked resolves a backend name to a Backend. Call with p.mu held.
+func (p *Pool) byNameLocked(name string) *Backend {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if b := p.byName[name]; b != nil {
+		return b
+	}
+	for _, b := range p.backends {
+		if strings.EqualFold(b.Name, name) {
+			return b
+		}
+	}
+	if live, ok := p.renamed[strings.ToLower(name)]; ok {
+		return p.byName[live]
+	}
+	return nil
+}
+
+// RenamedNames lists the retired names rooter still answers for, as configured.
+// Fixed at start, so it needs no lock.
+func (p *Pool) RenamedNames() []Renaming {
+	out := append([]Renaming(nil), p.formers...)
+	sort.Slice(out, func(i, j int) bool { return out[i].From < out[j].From })
+	return out
+}
+
+// Alias resolves a requested model that is really a backend name. "icarus" is not
 // a model, but it is a perfectly good answer to "which box do I want", and it is
 // the only such answer a client can discover on its own - so /v1/models advertises
 // one entry per backend and a request for it pins to that backend and nothing
-// else.
+// else. A name retired with -renamed resolves here too, which is what makes an
+// out-of-date client, or a session bound before the rename, work rather than 404.
 //
 // Returns the default model to hand upstream, or "" when no backend is named by
 // that id. A real model id always wins over an alias: the collision is resolved
@@ -134,7 +177,23 @@ func (p *Pool) Alias(model string) (*Backend, string) {
 		}
 	}
 	if b == nil {
-		return nil, ""
+		// Not a name in service today, so it may be a retired one. A retired name is
+		// the weakest claim available: if any box really does serve a model by that
+		// id, the request is routed by inventory instead of being pinned to wherever
+		// the old name used to point.
+		live, ok := p.renamed[strings.ToLower(model)]
+		if !ok {
+			return nil, ""
+		}
+		for _, x := range p.backends {
+			if x.Models[model] {
+				return nil, ""
+			}
+		}
+		b = p.byName[live]
+		if b == nil {
+			return nil, ""
+		}
 	}
 	if b.Models[model] {
 		return nil, "" // a real model that happens to share a box's name
@@ -508,7 +567,7 @@ func (p *Pool) Check(b *Backend) error {
 	b.Models = models
 	// Document order, not sorted: a runner lists the model it actually loaded
 	// first, and that is the one a backend-name alias has to resolve to. Sorting
-	// here would make "sushi" mean whichever id happened to sort lowest.
+	// here would make a box name mean whichever id happened to sort lowest.
 	b.ModelIDs = ids
 	b.DefaultModel = ""
 	if len(ids) > 0 {
@@ -625,7 +684,7 @@ func (p *Pool) ModelFilter(model string) func(*Backend) bool {
 	if model == "" || p.meta[normalizeModel(model)] {
 		return nil
 	}
-	// A backend name is a legitimate thing to ask for: "sushi" means "that box,
+	// A backend name is a legitimate thing to ask for: "icarus" means "that box,
 	// whatever it has loaded", and unlike a meta model it is a hard pin, not a
 	// preference. Restricting eligibility to one backend also makes spill and
 	// rebind structurally impossible, since there is no "rest" to spill onto.

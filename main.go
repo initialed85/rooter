@@ -19,6 +19,7 @@ const version = "0.1.0"
 type Config struct {
 	Listen         string
 	BackendSpecs   []string
+	RenamedSpecs   []string
 	backends       []*Backend
 	SessionTTL     time.Duration
 	MaxSessions    int
@@ -73,6 +74,7 @@ func parseFlags(args []string) (*Config, error) {
 
 Usage:
   rooter [flags] -backend NAME=URL[,token=TOKEN][,concurrency=N] -backend ...
+         [-renamed OLD=NEW]
 
 Flags:
 `, version)
@@ -91,9 +93,16 @@ backend's /models, and a name no backend claims is a 404 rather than an answer
 from another model.
 
 By default rooter answers /v1/models itself, with the union of every backend's
-models plus one entry per backend name ("strata", "sushi") that pins to that box
+models plus one entry per backend name ("strata", "icarus") that pins to that box
 and lets it pick its own loaded model. -no-catalog restores the old behaviour,
 where the list came from whichever backend happened to be free.
+
+A -renamed OLD=NEW keeps answering for a backend name that has been retired, and
+routes it to the box named on the right. Names outlive the machines they were
+written for - client configs, saved /model picks, and rooter's own session
+bindings - and a router that has forgotten one answers all of them with a 404.
+The old name is still advertised in /v1/models, marked with rooter.alias_of so it
+can be seen for what it is. Drop the flag and the name is gone for good.
 
 With -api-key set, every request must carry that key (Authorization: Bearer or
 x-api-key) except the health probes in -public-path. That is what makes it safe to
@@ -102,6 +111,7 @@ publish rooter on a routable address; the backends' own tokens stay in here.
 	}
 	fs.StringVar(&c.Listen, "listen", ":8089", "address for rooter to listen on")
 	fs.Var((*stringList)(&c.BackendSpecs), "backend", "backend spec, repeat once per backend")
+	fs.Var((*stringList)(&c.RenamedSpecs), "renamed", "retired backend name that should still resolve, as OLD=NEW (repeatable)")
 	fs.DurationVar(&c.SessionTTL, "session-ttl", 6*time.Hour, "forget a session after this long idle (0 = never)")
 	fs.IntVar(&c.MaxSessions, "max-sessions", 20000, "cap on tracked sessions (LRU evicted)")
 	fs.DurationVar(&c.MaxWait, "max-wait", 0, "how long to block for a free slot before 503 (0 = block forever)")
@@ -168,6 +178,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("rooter: %v", err)
 	}
+	renamed, err := parseRenamed(cfg.RenamedSpecs, backends)
+	if err != nil {
+		log.Fatalf("rooter: %v", err)
+	}
 	cfg.backends = backends
 
 	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
@@ -181,6 +195,7 @@ func main() {
 		HealthInterval: cfg.HealthInterval,
 		HealthTimeout:  cfg.HealthTimeout,
 		MetaModels:     cfg.MetaModels,
+		Renamed:        renamed,
 		Verbose:        cfg.Verbose,
 	}, &http.Client{Timeout: cfg.HealthTimeout}, logger)
 	pool.CheckAll()
@@ -211,6 +226,13 @@ func main() {
 		names = append(names, fmt.Sprintf("%s(%d)", b.Name, b.Concurrency))
 	}
 	logger.Printf("listening on %s -> %s", ln.Addr(), strings.Join(names, " "))
+	if len(renamed) > 0 {
+		pairs := make([]string, 0, len(renamed))
+		for _, rn := range renamed {
+			pairs = append(pairs, fmt.Sprintf("%s -> %s", rn.From, rn.To))
+		}
+		logger.Printf("retired names still routed: %s", strings.Join(pairs, ", "))
+	}
 	switch auth := newAuthGuard(cfg); {
 	case auth.enabled():
 		logger.Printf("api key required on the front door: %d key(s), %s reachable without one",

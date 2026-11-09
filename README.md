@@ -51,12 +51,16 @@ that have free capacity.
   a fresh session goes to the freest healthy backend, and it is then sticky like
   any other session (bindings stay per *(session, model)*, so `auto` and an
   explicit model id are tracked separately). Add more names with `-meta-model`.
-  This is how you use rooter as a balancer instead of a front door when the two
-  boxes hold different files: `auto` pools them, `qwen3.8-flash-next-iq3_xxs`
-  pins you to one. What you give up is the right to be surprised — llama.cpp
-  serves whatever it has loaded and echoes back the name you asked for, so an
-  `auto` answer may come from a different quant on different turns, and only
-  rooter's log or `rooter_backend_requests_total` says which.
+  This is how you use rooter as a balancer instead of a front door. It matters most
+  when the boxes hold different files - `auto` pools them, an explicit id pins you to
+  whichever boxes claim it - and it is still what you want when both boxes hold the
+  same file, which is the case today: `auto` and `qwen3.8-flash-next-iq3_xxs` both
+  pool strata and icarus, and a deliberate pin is a backend name (`strata`,
+  `icarus`). What you give up either way is the right to be surprised: llama.cpp
+  serves whatever it has loaded and echoes back the name you asked for, so an `auto`
+  answer can come from a different box - and, if the boxes ever hold different quants
+  again, a different quant - on different turns, and only rooter's log or
+  `rooter_backend_requests_total` says which.
 - **Concurrency is a real limit** — `-backend ...,concurrency=1` means one
   request in flight to that backend, full stop. Good for a box that hangs when
   you overload it.
@@ -116,8 +120,15 @@ go test -race ./...
     -listen :8089 \
     -api-key Password1 \
     -backend 'strata=http://192.168.11.128:8088/v1,token=Password1,concurrency=4' \
-    -backend 'sushi=http://192.168.137.111:8088/v1,token=Password1,concurrency=1'
+    -backend 'icarus=http://192.168.137.111:8088/v1,token=Password1,concurrency=4' \
+    -renamed 'sushi=icarus'
 ```
+
+That is the fleet today: two boxes, one runtime (llama.cpp), and the same model id
+published by both - `qwen3.8-flash-next-iq3_xxs` at 131072 ctx on each. There is
+therefore one model in the catalog naming two machines, and naming a box is the only
+way to ask for a particular one. The `-renamed` line is about the name that used to
+be there; see "Renaming a backend".
 
 A `-backend` flag per upstream. Spec keys: `name`, `url` (or `base`/`endpoint`),
 `token` (or `api-key`), `concurrency` (or `slots`). The name defaults to the
@@ -140,12 +151,43 @@ Useful flags:
 | `-health-interval` | `15s` | how often to re-poll `/models` (0 = start only) |
 | `-request-timeout` | `0` | hard cap on a generation request, queue included |
 | `-meta-model` | `auto`, `default` built in | extra names that mean "whichever backend is freest" |
+| `-renamed` | none | a retired backend name that should still resolve, as `OLD=NEW` (repeatable) |
 | `-spill-after` | `0` | after waiting this long on a busy sticky backend, take another eligible one (0 = never) |
 | `-scan-window` / `-max-body` | `1MiB` / `64MiB` | how much of a body is buffered for classification and replay |
 | `-api-key` | none | key clients must present; repeat for more than one; empty = open front door |
 | `-public-path` | `/rooter/healthz`, `/rooter/health` | path suffix reachable without `-api-key` |
 | `-xff` | off | let `X-Forwarded-For` be added upstream |
 | `-verbose` / `-quiet` | | log routing detail / log only failures |
+
+### Renaming a backend
+
+A backend name outlives the box it was attached to. Clients write it into
+`models.json`, Pi saves it as a `/model` choice, and rooter's session bindings hold
+one, so when a box is renamed or replaced every one of those keeps asking for a name
+that no longer means anything - and a router that has simply forgotten it answers
+them with a 404, which reads as an outage and is really a rename.
+
+`-renamed 'sushi=icarus'` says what the old name means now:
+
+* a request with `"model": "sushi"` pins to icarus exactly as a request for `icarus`
+  would, and goes upstream under the model icarus actually loaded;
+* a session binding written under the old name still finds a box, and is rewritten to
+  the live name on the way through, so the retired name is transitional rather than
+  something the router has to keep understanding;
+* `/v1/models` still advertises it, marked `"alias_of": "icarus"`, so a client can see
+  from the list itself that it is a redirect, and to where;
+* every response names the box that really answered (`X-Rooter-Backend: icarus`) and
+  the call record keeps `model_requested: "sushi"`, so the old name stays auditable
+  instead of disappearing into a new one;
+* a retired name is the *weakest* claim there is: if some box genuinely serves a model
+  with that id, the request is routed by inventory and the old name stops being a
+  pin. Renaming a box must not let it hijack a model that happens to share its name.
+
+`-renamed` is checked against the backends that exist, because a retired name that
+resolves to nothing is indistinguishable from a name nobody configured: it refuses an
+unknown target, a source that is a live backend name, and one name renamed to two
+boxes. Rooter keeps no fossil box names in its source - **removing the flag is what
+finally retires a name.**
 
 ### Front-door API key
 
@@ -243,10 +285,10 @@ different times:
   A held body is the one case where a header can still carry a number measured
   during the response, and it is the one body rooter can safely extend. The object
   carries the runner's own per-token numbers, normalised: both boxes report
-  timings and they disagree on the cache field's name (`cache_n` versus
-  `cached_n`), so those fold into `cached_tokens`, rates are derived when a runner
-  gave counts and a duration but no throughput, and the runner's raw `timings` is
-  kept verbatim under `extra` so anything rooter does not model is still
+  timings, and llama.cpp builds have disagreed on the cache field's name (`cache_n`
+  versus `cached_n`), so those fold into `cached_tokens`, rates are derived when a
+  runner gave counts and a duration but no throughput, and the runner's raw `timings`
+  is kept verbatim under `extra` so anything rooter does not model is still
   recoverable.
 
 `prompt_tokens` is the prompt length. `prompt_tokens_computed` is what the runner
@@ -254,8 +296,9 @@ actually evaluated: the prompt minus whatever it served from the KV cache.
 Confusing the two makes a cache hit look like a tiny prompt, pushes `cache_hit_rate`
 above 1, and prices a warm prefill at a speed nobody achieved.
 
-**`prompt_n` does not mean the same thing on both of our runners.** These are two
-live payloads of the same field name, taken from `/rooter/events` on 2026-11-04:
+**`prompt_n` does not mean the same thing on every llama.cpp build.** These are two
+live payloads of the same field name, taken from `/rooter/events` on 2026-11-04, when
+the fleet was two different builds:
 
 | backend   | `prompt_n` | cached   | `prompt_ms` | states `prompt_per_second` | work done |
 |-----------|-----------:|---------:|------------:|---------------------------:|----------:|
@@ -264,17 +307,32 @@ live payloads of the same field name, taken from `/rooter/events` on 2026-11-04:
 
 `44 / 0.5605s` is 78.5, so strata's `prompt_n` is already the work done. For sushi,
 `49161 / 1.924s` is 25,552 tok/s — nothing it ever said — while `435 / 1.924s` is
-226.096 to the digit it printed. Sushi's `prompt_n` is the **prompt length with the
+226.096 to the digit it printed. Sushi's `prompt_n` was the **prompt length with the
 cached prefix still inside it**.
 
-Neither build is wrong and neither is going to be renamed, so rooter decides which
+Only the first of those two boxes is still in the fleet, and today both agree:
+measured on 2026-11-09 each reported `cache_n` and the work convention (`prompt_n=7`,
+`cache_n=9`, `prompt_per_second` reproducing `7 / 0.0989s` on one, `prompt_n=16`,
+`cache_n=0` on the other). The normalisation stays, and that is a decision rather
+than tidiness:
+
+* it selects on the **runner's own arithmetic**, never on a backend name, so a
+  well-behaved box pays nothing for it and a box that changes its mind is caught on
+  the first response instead of in a dashboard a week later;
+* removing it would take `prompt_tokens_computed`, the reconstruction of
+  `prompt_tokens` and the refusal to correct a contradictory `cache_hit_rate` with
+  it, which is most of what makes these numbers safe to price against;
+* both conventions are still exercised, by fixtures named for the convention rather
+  than for a machine that no longer exists.
+
+Neither build was wrong and neither was told about the other, so rooter decides which
 convention it is dealing with from the runner's own arithmetic: it publishes a
 throughput, and only one of `prompt_n / prompt_ms` or
 `(prompt_n - cached) / prompt_ms` reproduces it. Rooter divides the same way the
-runner did, which is the only way both backends can share a column. When it
-subtracts, the row carries `runner_prompt_n_includes_cache: true` — and the same key
-in `extra` — because a normalisation a reader cannot see is a number they are
-forced to trust. If you want the runner's raw figure back, add `cached_tokens` on.
+runner did, which is the only way two boxes can share a column. When it subtracts,
+the row carries `runner_prompt_n_includes_cache: true` — and the same key in `extra`
+— because a normalisation a reader cannot see is a number they are forced to trust. If
+you want the runner's raw figure back, add `cached_tokens` on.
 
 They are not two spellings of one number, and `prompt_tokens` is not always a
 measurement. It is read from `usage.prompt_tokens` when the runner sends a usage
@@ -339,23 +397,28 @@ like:
     },
     {
       "id": "qwen3.8-flash-next-iq3_xxs",
-      "name": "Qwen 3.8 Flash Next (rooter -> strata)",
+      "name": "Qwen 3.8 Flash Next (rooter -> whichever box is free)",
       "api": "openai-responses"
     },
     {
-      "id": "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw",
-      "name": "Qwen 3.8 Flash Next (rooter -> sushi)"
+      "id": "strata",
+      "name": "Qwen 3.8 Flash Next (rooter -> strata)"
+    },
+    {
+      "id": "icarus",
+      "name": "Qwen 3.8 Flash Next (rooter -> icarus)"
     }
   ]
 }
 ```
 
 `/model rooter/auto` is the interesting one: it pools both boxes, so a new Pi
-session lands on whichever has slots free and then stays there for the rest of
-that conversation. `/model rooter/qwen3.8-flash-next-iq3_xxs` is a deliberate
-pin to one box. Note the id `auto` is not a real model - llama.cpp will answer it
-with the weights it has loaded, which is the whole point, and Pi cannot tell from
-the response which box replied.
+session lands on whichever has slots free and then stays there for the rest of that
+conversation. Since both boxes publish the same id, `qwen3.8-flash-next-iq3_xxs`
+pools too - a deliberate pin to one machine is now a request for its name, which is
+also what `/v1/models` advertises. Note the id `auto` is not a real model - llama.cpp
+will answer it with the weights it has loaded, which is the whole point, and Pi cannot
+tell from the response which box replied.
 
 `apiKey` is the **rooter** key, i.e. the value of rooter's `-api-key`. It is not
 the backend token and it is not the same string just because both happen to be

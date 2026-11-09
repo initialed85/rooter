@@ -131,8 +131,8 @@ type callRecord struct {
 
 	// Extra is the upstream's own timings object, verbatim. Rooter normalises the
 	// fields above and keeps nothing of the source shape, so anything it does not
-	// model is still recoverable - the two boxes already disagree here, strata
-	// saying cache_n where sushi says cached_n.
+	// model is still recoverable - which matters because our runners have disagreed
+	// here, one spelling the cache count cache_n and the other cached_n.
 	Extra json.RawMessage `json:"extra,omitempty"`
 }
 
@@ -163,8 +163,9 @@ type timingsRaw struct {
 	PredictedN         *int     `json:"predicted_n"`
 	PredictedMS        *float64 `json:"predicted_ms"`
 	PredictedPerSecond *float64 `json:"predicted_per_second"`
-	// strata spells this cache_n, sushi spells it cached_n. Neither is wrong and
-	// neither is going to change, so rooter reads both and the client sees one.
+	// Some llama.cpp builds spell this cache_n and some spell it cached_n; our boxes
+	// have done one each. Neither spelling is wrong and nothing in the response says
+	// which is arriving, so rooter reads both and the client sees one field.
 	CacheN  *int `json:"cache_n"`
 	CachedN *int `json:"cached_n"`
 }
@@ -225,10 +226,13 @@ func (c *callRecord) absorb(doc *timingsDoc) {
 	} else if t.CachedN != nil {
 		c.CachedTokens = t.CachedN
 	}
-	// `prompt_n` does not mean the same thing on both runners, and the difference is
+	// `prompt_n` does not mean the same thing on every runner, and the difference is
 	// not cosmetic - it is a factor of a hundred in prefill_tok_s on a warm cache.
 	//
-	// Taken live off the network on 2026-11-04, same field name, two backends:
+	// Taken live off the network on 2026-11-04, same field name, two backends (the
+	// pair that made this a rule; the second box is retired, both conventions are
+	// still exercised by tests because a build can change its mind without telling
+	// anybody):
 	//
 	//   strata  prompt_n=44    cached=95545 prompt_ms=560.5    prompt_per_second=78.5
 	//           44 / 0.5605s    = 78.5   matches what it states
@@ -236,9 +240,10 @@ func (c *callRecord) absorb(doc *timingsDoc) {
 	//           49161 / 1.924s  = 25552  nothing like what it states
 	//           435 / 1.924s    = 226.1  exactly what it states
 	//
-	// So strata's prompt_n is the work done and sushi's is the prompt size with the
-	// cached prefix still inside it. Neither is wrong; they are two builds of llama.cpp
-	// with two conventions and no field name to tell them apart.
+	// So one runner's prompt_n is the work done and the other's is the prompt size
+	// with the cached prefix still inside it. Neither is wrong; they are two builds of
+	// llama.cpp with two conventions and no field name to tell them apart - which is
+	// why the branch below reads the runner rather than the backend's name.
 	//
 	// The runner reveals which one it is by doing its own arithmetic in front of us:
 	// it publishes a throughput, and only one of prompt_n/prompt_ms or

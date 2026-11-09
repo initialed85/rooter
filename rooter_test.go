@@ -213,12 +213,17 @@ func newEnv(t *testing.T, specs []string, tweak func(*Config)) *testEnv {
 	if tweak != nil {
 		tweak(cfg)
 	}
+	renamed, err := parseRenamed(cfg.RenamedSpecs, backends)
+	if err != nil {
+		t.Fatalf("parseRenamed: %v", err)
+	}
 	lb := &safeBuf{}
 	lg := log.New(lb, "", 0)
 	pool := NewPool(backends, PoolOpts{
 		Poll:          20 * time.Millisecond,
 		HealthTimeout: cfg.HealthTimeout,
 		MetaModels:    cfg.MetaModels,
+		Renamed:       renamed,
 		Verbose:       cfg.Verbose,
 	}, &http.Client{Timeout: cfg.HealthTimeout}, lg)
 	sess := NewSessionStore(cfg.SessionTTL, cfg.MaxSessions, lg)

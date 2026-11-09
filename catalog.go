@@ -13,8 +13,9 @@ import (
 // The bug this file exists for: /v1/models used to be a passthrough, so the
 // answer depended on which backend happened to be free. Two calls a second apart
 // on the live box returned disjoint lists - one gave strata's single model, the
-// next gave sushi's four. A client picking from that list is choosing from
-// whichever box answered first, and rooter knows the union.
+// next gave sushi's four (that box was sushi, retired 2026-11). A client picking
+// from that list is choosing from whichever box answered first, and rooter knows
+// the union.
 //
 // So rooter builds the catalog itself. It stays a router, not a registry: every
 // entry is derived from what a backend actually reported, and nothing is invented.
@@ -35,6 +36,7 @@ type modelRooterInfo struct {
 	Backend      string   `json:"backend,omitempty"`
 	Backends     []string `json:"backends,omitempty"`
 	Alias        bool     `json:"alias,omitempty"`
+	AliasOf      string   `json:"alias_of,omitempty"` // this id is a retired name; this box is what it now means
 	Meta         bool     `json:"meta,omitempty"`
 	DefaultModel string   `json:"default_model,omitempty"`
 	Healthy      bool     `json:"healthy"`
@@ -101,6 +103,36 @@ func (p *Pool) Catalog() []modelEntry {
 				Backend:      b.Name,
 				Backends:     []string{b.Name},
 				Alias:        true,
+				DefaultModel: b.DefaultModel,
+				Healthy:      b.Healthy,
+				SlotsFree:    b.free(),
+				SlotsTotal:   b.Concurrency,
+			},
+		})
+	}
+
+	// Retired names, advertised so a client still asking for one can see in the
+	// list itself that it is a redirect, and to which box. Same collision rule as
+	// every other synthetic entry: a real model carrying that id wins, and the
+	// entry is dropped rather than shadowing it.
+	for _, rn := range p.formers {
+		if _, taken := byID[rn.From]; taken {
+			continue
+		}
+		b := p.byName[rn.To]
+		if b == nil {
+			continue
+		}
+		out = append(out, modelEntry{
+			ID:       rn.From,
+			Object:   "model",
+			OwnedBy:  "rooter",
+			priority: 1,
+			Rooter: modelRooterInfo{
+				Backend:      b.Name,
+				Backends:     []string{b.Name},
+				Alias:        true,
+				AliasOf:      b.Name,
 				DefaultModel: b.DefaultModel,
 				Healthy:      b.Healthy,
 				SlotsFree:    b.free(),

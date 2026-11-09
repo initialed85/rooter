@@ -42,9 +42,10 @@ type requestInfo struct {
 	KeySource string // header | field | prefix | none
 	Model     string
 	// Resolved is what rooter turned Model into when the two differ, which today
-	// means a backend-name alias: the client asked for "sushi", the box answered as
-	// its own loaded model. Only rooter can know this, because the response echoes
-	// whatever the client asked for.
+	// means a backend-name alias: the client asked for a box by name ("icarus", or a
+	// retired name that -renamed still resolves), and the box answered as its own
+	// loaded model. Only rooter can know this, because the response echoes whatever
+	// the client asked for.
 	Resolved string
 }
 
