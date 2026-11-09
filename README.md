@@ -138,10 +138,11 @@ go test -race ./...
     -renamed 'sushi=icarus'
 ```
 
-That is the fleet today: two boxes, one runtime (llama.cpp), and the same model id
-published by both - `qwen3.8-flash-next-iq3_xxs` at 131072 ctx on each. There is
-therefore one model in the catalog naming two machines, and naming a box is the only
-way to ask for a particular one. The `-renamed` line is about the name that used to
+That is the fleet today: two boxes, one runtime (llama.cpp), and each publishing its
+own list - `qwen3.8-flash-next-iq3_xxs` at 131072 ctx on edward-desktop, and
+`qwen3.8-flash-next`, `-chat` and `-reasoner` on icarus. Naming a box is therefore
+the only way to ask for a particular machine, and a model id is matched against what
+each box says it serves. The `-renamed` line is about the name that used to
 be there; see "Renaming a backend".
 
 A `-backend` flag per upstream. Spec keys: `name`, `url` (or `base`/`endpoint`),
@@ -170,6 +171,7 @@ Useful flags:
 | `-scan-window` / `-max-body` | `1MiB` / `64MiB` | how much of a body is buffered for classification and replay |
 | `-api-key` | none | key clients must present; repeat for more than one; empty = open front door |
 | `-public-path` | `/rooter/healthz`, `/rooter/health` | path suffix reachable without `-api-key` |
+| `-metrics-listen` | `""` | a second, keyless listener serving only `/rooter/metrics`, for a scraper that should not have to hold the front-door key |
 | `-xff` | off | let `X-Forwarded-For` be added upstream |
 | `-verbose` / `-quiet` | | log routing detail / log only failures |
 
@@ -266,6 +268,20 @@ without becoming four lines a minute, and the recovery line carries the length o
 the outage, since a box coming back used to leave no trace of how long it had been
 gone. `errors_total` deliberately does not move for those repeated probes — see
 [Looking at it](#looking-at-it).
+
+### Scraping metrics without a key
+
+`-metrics-listen :8090` opens a second listener that serves **only**
+`/rooter/metrics`, with no key. The reason is operational rather than technical:
+a scraper that has to be handed the front-door key is a scraper that breaks every
+time the key rotates, and in a fleet where the key lives in one namespace and the
+scraper in another, keeping two copies in step is a manual step nobody does
+reliably. The listener is deliberately narrow - `/rooter/stats`, `/rooter/backends`,
+`/rooter/sessions` and the proxied paths all 404 there - because a keyless port that
+also served session ids and backend inventories would be a much larger disclosure
+than a set of counters, and a port that only ever serves metrics is a port that can
+be left off the ingress entirely. `/rooter/metrics` on the main listener still needs
+the key; nothing about the front door changes.
 
 ### Looking at it
 

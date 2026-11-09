@@ -55,6 +55,26 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// metricsOnly is the entirety of a second, keyless listener: the Prometheus
+// scrape and nothing else. It exists so a scraper need not hold the front-door
+// key - a scrape that has to be re-fed a rotating secret is a scrape that breaks
+// twice. The narrowness is deliberate: a keyless listener that also served
+// /rooter/sessions or /rooter/backends would disclose far more than counters, and
+// a port that only ever serves metrics is a port that can be left off the ingress.
+func (r *Router) metricsOnly(w http.ResponseWriter, req *http.Request) {
+	path := strings.Trim(strings.Trim(req.URL.Path, "/"), "/")
+	if path != "rooter/metrics" {
+		errJSON(w, http.StatusNotFound, "this listener serves only /rooter/metrics")
+		return
+	}
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		errJSON(w, http.StatusMethodNotAllowed, "metrics are a GET")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	r.prometheus(w)
+}
+
 func (r *Router) adminIndex(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprintf(w, "rooter - transparent LLM router (uptime %s)\n\n", time.Since(r.start).Round(time.Second))

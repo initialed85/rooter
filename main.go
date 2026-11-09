@@ -18,6 +18,7 @@ const version = "0.1.0"
 
 type Config struct {
 	Listen         string
+	MetricsListen  string
 	BackendSpecs   []string
 	RenamedSpecs   []string
 	backends       []*Backend
@@ -107,9 +108,15 @@ can be seen for what it is. Drop the flag and the name is gone for good.
 With -api-key set, every request must carry that key (Authorization: Bearer or
 x-api-key) except the health probes in -public-path. That is what makes it safe to
 publish rooter on a routable address; the backends' own tokens stay in here.
+
+-metrics-listen opens a second listener that serves nothing but /rooter/metrics,
+with no key, so a scraper does not have to hold the front-door key: a scrape that
+must be re-fed a rotating secret is a scrape that breaks twice. Only the metrics
+path answers there, which is why that port can be left off the ingress entirely.
 `)
 	}
 	fs.StringVar(&c.Listen, "listen", ":8089", "address for rooter to listen on")
+	fs.StringVar(&c.MetricsListen, "metrics-listen", "", "address for a second, keyless listener serving only /rooter/metrics (empty = no separate listener)")
 	fs.Var((*stringList)(&c.BackendSpecs), "backend", "backend spec, repeat once per backend")
 	fs.Var((*stringList)(&c.RenamedSpecs), "renamed", "retired backend name that should still resolve, as OLD=NEW (repeatable)")
 	fs.DurationVar(&c.SessionTTL, "session-ttl", 6*time.Hour, "forget a session after this long idle (0 = never)")
@@ -210,22 +217,53 @@ func main() {
 	if err != nil {
 		log.Fatalf("rooter: listen %s: %v", cfg.Listen, err)
 	}
+	var metricsLn net.Listener
+	if cfg.MetricsListen != "" {
+		metricsLn, err = net.Listen("tcp", cfg.MetricsListen)
+		if err != nil {
+			// A scraper with no listener loses its data silently, so a bad
+			// -metrics-listen is worth failing loudly on at startup rather than
+			// discovering at 3am from an empty dashboard.
+			log.Fatalf("rooter: metrics listen %s: %v", cfg.MetricsListen, err)
+		}
+	}
 	srv := &http.Server{
 		Handler:           router,
 		ReadHeaderTimeout: 60 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
+	var metricsSrv *http.Server
+	if metricsLn != nil {
+		metricsSrv = &http.Server{
+			Handler:           http.HandlerFunc(router.metricsOnly),
+			ReadHeaderTimeout: 30 * time.Second,
+			IdleTimeout:       2 * time.Minute,
+			MaxHeaderBytes:    1 << 20,
+		}
+		go func() {
+			if err := metricsSrv.Serve(metricsLn); err != nil && err != http.ErrServerClosed {
+				logger.Printf("rooter: metrics serve: %v", err)
+			}
+		}()
+	}
 	go func() {
 		<-ctx.Done()
 		logger.Printf("shutting down (in-flight requests are not drained)")
 		srv.Close()
+		if metricsSrv != nil {
+			metricsSrv.Close()
+		}
 	}()
 	names := make([]string, 0, len(backends))
 	for _, b := range backends {
 		names = append(names, fmt.Sprintf("%s(%d)", b.Name, b.Concurrency))
 	}
 	logger.Printf("listening on %s -> %s", ln.Addr(), strings.Join(names, " "))
+	if metricsLn != nil {
+		logger.Printf("metrics without a key on %s - only /rooter/metrics answers there; keep it off the ingress",
+			metricsLn.Addr())
+	}
 	if len(renamed) > 0 {
 		pairs := make([]string, 0, len(renamed))
 		for _, rn := range renamed {
