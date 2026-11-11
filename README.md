@@ -269,6 +269,18 @@ the outage, since a box coming back used to leave no trace of how long it had be
 gone. `errors_total` deliberately does not move for those repeated probes — see
 [Looking at it](#looking-at-it).
 
+A request that ends because the *client* stopped caring is not evidence about a
+backend either. When the caller's context is what killed a round trip — a timeout,
+or a tab closed mid-generation — rooter records an abandonment (`499`,
+`rooter_aborted_total`) and leaves the backend's health exactly where it was.
+Retrying onto another box would buy nothing either: the context is already dead, so
+the second attempt fails instantly as well. Getting this wrong was a real outage of
+a different kind: two clients hanging up on a saturated pair of boxes marked both
+of them unhealthy within seconds, and every request still queued behind them was
+told there was no healthy backend for `auto`. Slow is a capacity problem and the
+queue is where it is answered; only a box that fails its own probes is declared
+dead.
+
 ### Scraping metrics without a key
 
 `-metrics-listen :8090` opens a second listener that serves **only**

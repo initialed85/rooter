@@ -303,3 +303,98 @@ func promLine(t *testing.T, metrics, sample string) float64 {
 	t.Fatalf("metrics do not contain the sample %q:\n%s", sample, metrics)
 	return 0
 }
+
+// The other way a pool goes empty is a router that believes a hangup is an outage.
+// Both boxes were healthy, neither had failed a probe, and rooter still answered
+// "no healthy backend serves model auto" — seen live on 2026-11-11, with the fleet's
+// Graphiti extraction queue draining into dropped memories behind it. The log that
+// gave it away was two `marked unhealthy: context canceled` lines seconds apart, one
+// per backend: clients abandoning long generations on a saturated box, and the retry
+// replaying the same dead context onto the other box and marking that one too.
+func TestAHungUpClientDoesNotTakeThePoolDownWithIt(t *testing.T) {
+	slow := newFake(t, "strata", "qwen-tiny", "")
+	slow.setLatency(3 * time.Second)
+	other := newFake(t, "icarus", "qwen-tiny", "")
+	e := newEnv(t, []string{"strata=" + slow.url(), "icarus=" + other.url()}, nil)
+	e.pool.CheckAll()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Named at the slow box, so the attempt is deterministic: "auto" would happily be
+	// answered by the fast one and the test would cancel nothing.
+	req := postJSON("/v1/chat/completions", `{"model":"strata","messages":[{"role":"user","content":"x"}]}`)
+	req = req.WithContext(ctx)
+	req.URL.Scheme = "http"
+	req.URL.Host = e.addr()
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := e.srv.Client().Do(req); err == nil {
+		t.Error("the hung-up request completed, so the test never exercised a cancellation")
+	}
+	// The round trip has to have actually reached the slow box first, or this proves
+	// nothing about what a cancellation does to the pool.
+	eventually(t, 2*time.Second, "the slow backend to have been asked", func() bool {
+		return slow.genCounts() > 0
+	})
+
+	// The accounting for an abandonment happens when the handler unwinds, which is a
+	// moment after the client's Do returns - and it happens *after* any decision to mark
+	// the backend, so waiting for it is what makes the assertions below deterministic
+	// rather than a race against the handler goroutine.
+	eventually(t, 2*time.Second, "the hangup to be recorded as an abandonment (499), which is what proves rooter blamed the client and not the box", func() bool {
+		n, _ := e.router.Stats()["aborted"].(int64)
+		return n > 0
+	})
+
+	for _, name := range []string{"strata", "icarus"} {
+		if b := e.pool.Lookup(name); b == nil || !b.Healthy {
+			t.Errorf("%s is marked unhealthy because a client stopped listening: healthy=%v", name, b != nil && b.Healthy)
+		}
+	}
+	if n := other.genCounts(); n > 0 {
+		t.Errorf("a cancelled request was retried onto the second backend %d time(s); the context is already dead, so the retry buys nothing and marks a healthy box for it", n)
+	}
+
+	// And the pool has to still be able to answer somebody else.
+	res, body := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"auto","messages":[{"role":"user","content":"x"}]}`), "after-hangup"))
+	if res.StatusCode != 200 {
+		t.Fatalf("the request after a hangup got %d: %s", res.StatusCode, body)
+	}
+	if strings.Contains(body, "no healthy backend") {
+		t.Errorf("one hung-up client emptied the pool: %s", body)
+	}
+}
+
+// The guard rail on the guard rail: a box that actually dies mid-request still gets
+// marked. Softening the cancellation case must not turn into rooter shrugging at real
+// failures, because then a dead box keeps being picked and every client pays for it.
+func TestABackendThatReallyDiesIsStillMarked(t *testing.T) {
+	bad := newFake(t, "strata", "qwen-tiny", "")
+	good := newFake(t, "icarus", "qwen-tiny", "")
+	e := newEnv(t, []string{"strata=" + bad.url(), "icarus=" + good.url()}, nil)
+	e.pool.CheckAll()
+	bad.setBreak(true)
+
+	// Named at the dying box, so the attempt is deterministic. A box name is a pin,
+	// so there is nothing to retry onto and the client is told the truth.
+	res, body := e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"strata","messages":[{"role":"user","content":"x"}]}`), "dying-box"))
+	if res.StatusCode == 200 {
+		t.Fatalf("a backend that closed the connection without answering returned 200: %s", body)
+	}
+	if b := e.pool.Lookup("strata"); b == nil || b.Healthy {
+		t.Error("a backend that dropped the connection stayed marked healthy; a dead box must leave the rotation")
+	}
+	if b := e.pool.Lookup("icarus"); b == nil || !b.Healthy {
+		t.Error("the box that was never asked anything got marked too, which is the cascade this change is about")
+	}
+
+	// And the survivor still answers.
+	res, body = e.do(withSession(postJSON("/v1/chat/completions",
+		`{"model":"icarus","messages":[{"role":"user","content":"x"}]}`), "survivor"))
+	if res.StatusCode != 200 {
+		t.Fatalf("the healthy backend got %d: %s", res.StatusCode, body)
+	}
+}

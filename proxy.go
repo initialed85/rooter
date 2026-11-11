@@ -339,6 +339,12 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // and on the panic path, so it must not assume anything about how far dispatch
 // got. Returns the attempt through res so the caller sees the final status.
 func (r *Router) settle(w *replyWriter, req *http.Request, res *attempt, b *Backend, info requestInfo, out *Outcome, start time.Time, slot, aborted bool, rec *callRecord) {
+	// A caller that hung up before a byte moved is the same outcome as one that hung up
+	// mid-stream, and gets counted the same way: dispatch reports it as 499, and without
+	// this it would land in byStatus as an abandonment nobody counted.
+	if res.status == statusAborted {
+		aborted = true
+	}
 	if res.status == 0 && !aborted {
 		res.status = http.StatusBadGateway
 		if !res.wrote {
@@ -393,6 +399,22 @@ func (r *Router) dispatch(ctx context.Context, w *replyWriter, req *http.Request
 		res = r.roundTrip(ctx, w, req, b, body, partial, rec)
 		if res.err == nil || res.wrote {
 			return res
+		}
+		// Hanging up is not dying, and confusing the two takes a healthy fleet down.
+		//
+		// When the caller's context is what ended the round trip - the client timed
+		// out, or closed the connection mid-generation - the backend never said
+		// anything. Marking it anyway used to be the worst kind of bug: the retry then
+		// replayed the request onto the other box with the same dead context, failed
+		// instantly, marked that one too, and a router with two perfectly healthy
+		// backends answered "no healthy backend serves model auto" to everything still
+		// queued behind them. One impatient client could brown out the pool.
+		//
+		// Slow is a capacity problem, and capacity problems are what the queue, the
+		// spill and the wait histogram are for. Whether a box is alive is the health
+		// loop's call.
+		if done := ctx.Err(); done != nil && errors.Is(res.err, done) {
+			return attempt{status: statusAborted, err: errAborted, wrote: res.wrote, bytes: res.bytes, ttfb: res.ttfb}
 		}
 		r.pool.MarkUnhealthy(b, res.err.Error())
 		if len(tried) >= maxAttempts || len(tried) >= len(r.pool.Backends()) {
