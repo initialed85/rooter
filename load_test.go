@@ -334,3 +334,61 @@ func TestTheRunnersOwnPrefillWindowPricesColdWork(t *testing.T) {
 		t.Errorf("coldPrefillTokS = %v, want 40,500 tokens over 16.08 s of post-handoff time", doc["coldPrefillTokS"])
 	}
 }
+
+// TestBackendsFieldContractIsWhatCallersDependOn pins the five fields a caller has
+// built a decision on - pi-ed's idle-compaction pre-flight reads them to decide
+// whether to defer a summarisation - so that a rename or a meaning change fails a
+// build rather than turning a shipped fleet rule into guesswork.
+//
+// The invariant worth pinning is not any single field, it is the arithmetic between
+// two of them: busy + slotsFree == concurrency, always, because both read one
+// semaphore (free() is cap(sem) - len(sem)). And the trap worth pinning is what
+// concurrency means: it is rooter's admission limit from the -backend spec, not the
+// runner's slot count. strata answers /props total_slots=1 while home-ops passes
+// concurrency=4, so slotsFree on that box is headroom for rooter to hand it work,
+// not evidence that the box can run it in parallel.
+func TestBackendsFieldContractIsWhatCallersDependOn(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url() + ",concurrency=4"}, func(c *Config) { c.RequestTimeout = 0 })
+
+	_, raw := e.do(get("/rooter/backends"))
+	doc := docByName(backendsDoc(t, raw), "a")
+	if doc == nil {
+		t.Fatalf("no backend a in %s", raw)
+	}
+	for _, key := range []string{"name", "busy", "concurrency", "healthy", "slotsFree"} {
+		if _, ok := doc[key]; !ok {
+			t.Errorf("%s is missing from /rooter/backends; a caller is depending on it: %s", key, raw)
+		}
+	}
+	if doc["name"] != "a" {
+		t.Errorf("name = %#v, want the backend's own name", doc["name"])
+	}
+	if _, ok := doc["healthy"].(bool); !ok {
+		t.Errorf("healthy = %#v, want a JSON boolean", doc["healthy"])
+	}
+	busy, _ := field(t, doc, "busy")
+	free, _ := field(t, doc, "slotsFree")
+	concurrency, _ := field(t, doc, "concurrency")
+	if concurrency != 4 {
+		t.Fatalf("concurrency = %v, want the 4 from the -backend spec", doc["concurrency"])
+	}
+	if busy+free != concurrency {
+		t.Errorf("busy(%v) + slotsFree(%v) != concurrency(%v): a caller comparing slotsFree > 0 against busy < concurrency is now reading two different boxes",
+			busy, free, concurrency)
+	}
+
+	// The meaning, not just the shape: rooter reports what it was told to admit, and
+	// nothing about how many slots the runner actually runs. A backend declared with
+	// no concurrency=N gets 1, so its slotsFree collapses to a 0/1 flag while the box
+	// may be running four internally.
+	e2 := newEnv(t, []string{"b=" + newFake(t, "b", "test-model", "").url()}, nil)
+	_, raw = e2.do(get("/rooter/backends"))
+	doc = docByName(backendsDoc(t, raw), "b")
+	if got, _ := field(t, doc, "concurrency"); got != 1 {
+		t.Errorf("concurrency = %v on a backend given no explicit concurrency, want the pool default 1", doc["concurrency"])
+	}
+	if got, _ := field(t, doc, "slotsFree"); got != 1 {
+		t.Errorf("slotsFree = %v on an idle default-width backend, want 1", doc["slotsFree"])
+	}
+}
