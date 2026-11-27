@@ -292,3 +292,45 @@ func TestAbandonedGenerationReleasesItsLoadNote(t *testing.T) {
 		t.Errorf("the abandonment was not counted at all")
 	}
 }
+
+// TestTheRunnersOwnPrefillWindowPricesColdWork is the fix for what the first live
+// read of this endpoint caught: strata published coldPrefillTokS 793,590.6 off one
+// sample, which is not a box evaluating a prompt at 800k tok/s, it is a prefix-cache
+// restore arriving as prompt_n with cached=0 and a first byte 50 ms later. Rooter
+// prices cold work against the duration the runner measured around the work it did,
+// and falls back to its own post-handoff clock only when the runner says nothing.
+func TestTheRunnersOwnPrefillWindowPricesColdWork(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url()}, nil)
+
+	prefillMs := 560.0
+	e.pool.ObserveLoad(&callRecord{
+		Backend: "a", TTFTMs: 50, WaitMs: 0, PrefillMs: &prefillMs,
+		PromptTokens: loadInt(40500), PromptTokensComputed: loadInt(40500),
+	})
+
+	raw, err := e.pool.SnapshotJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := docByName(backendsDoc(t, string(raw)), "a")
+	got, _ := field(t, doc, "coldPrefillTokS")
+	if !near(got, 40500/0.560, 0.01) {
+		t.Errorf("coldPrefillTokS = %v, want %v: the runner reported a 560 ms prefill window and rooter priced the work against 50 ms of first-byte time",
+			got, 40500/0.560)
+	}
+	if got > 150000 {
+		t.Errorf("coldPrefillTokS = %v, which is a restore wearing a prefill's clothes", got)
+	}
+
+	// No prefill window reported: rooter's own clock is the only evidence there is.
+	b := newFake(t, "b", "test-model", "")
+	untimed := newEnv(t, []string{"b=" + b.url()}, nil)
+	untimed.pool.ObserveLoad(&callRecord{Backend: "b", TTFTMs: 16200, WaitMs: 120,
+		PromptTokens: loadInt(40500), PromptTokensComputed: loadInt(40500)})
+	raw, _ = untimed.pool.SnapshotJSON()
+	doc = docByName(backendsDoc(t, string(raw)), "b")
+	if got, _ := field(t, doc, "coldPrefillTokS"); !near(got, 40500/16.08, 0.01) {
+		t.Errorf("coldPrefillTokS = %v, want 40,500 tokens over 16.08 s of post-handoff time", doc["coldPrefillTokS"])
+	}
+}

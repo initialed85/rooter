@@ -633,11 +633,23 @@ func (p *Pool) EndFlight(b *Backend, id int64) {
 // restored at least 2,000 tokens, which measures prefix restore, typically ten to
 // thirty times faster. Mixing them produces a rate that describes neither box.
 func (p *Pool) ObserveLoad(rec *callRecord) {
-	if rec == nil || rec.TTFTMs <= 0 || rec.Backend == "" {
+	if rec == nil || rec.Backend == "" {
 		return
 	}
-	postHandoffS := (rec.TTFTMs - rec.WaitMs) / 1000
-	if postHandoffS <= 0 {
+	// The denominator is the runner's own measured prompt-evaluation window when it
+	// made one, and rooters post-handoff clock only as a fallback. That preference is
+	// what the first live read of this endpoint proved necessary: strata reported
+	// `coldPrefillTokS: 793590.6` off a single sample, which is a cache restore being
+	// priced as fresh work. A runner that hands back 40k tokens of prompt_n with
+	// cached=0 and a first byte in 50 ms is not evaluating at 800k tok/s, it is
+	// restoring from its prefix cache and calling the result prompt_n. prompt_ms is
+	// the one number it cannot fudge, because it is a duration the runner measured
+	// around the work it actually did.
+	denomS := (rec.TTFTMs - rec.WaitMs) / 1000
+	if rec.PrefillMs != nil && *rec.PrefillMs > 0 {
+		denomS = *rec.PrefillMs / 1000
+	}
+	if denomS <= 0 {
 		return
 	}
 	prompt, computed, cached := 0, 0, 0
@@ -665,11 +677,16 @@ func (p *Pool) ObserveLoad(rec *callRecord) {
 	}
 	switch {
 	case computed >= 2000 && (prompt == 0 || computed*2 >= prompt):
-		b.ColdTokS = rate(b.ColdTokS, b.ColdSamples > 0, float64(computed)/postHandoffS)
+		b.ColdTokS = rate(b.ColdTokS, b.ColdSamples > 0, float64(computed)/denomS)
 		b.ColdSamples++
 	case cached >= 2000:
-		b.RestoreTokS = rate(b.RestoreTokS, b.RestoreSamps > 0, float64(cached)/postHandoffS)
-		b.RestoreSamps++
+		// A restore is priced against what the caller could observe, because the
+		// runner measures no duration for work it skipped: prompt_ms covers the
+		// tokens it evaluated, not the prefix it read back.
+		if ttftS := (rec.TTFTMs - rec.WaitMs) / 1000; ttftS > 0 {
+			b.RestoreTokS = rate(b.RestoreTokS, b.RestoreSamps > 0, float64(cached)/ttftS)
+			b.RestoreSamps++
+		}
 	}
 }
 
