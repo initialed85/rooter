@@ -93,15 +93,15 @@ func (e *eventRing) since(after int64, limit int) ([]*callRecord, int64, int64) 
 // not the number anyone actually wants, which is whether a given model on a
 // given box is slow, or whether the cache is being hit at all.
 type modelStats struct {
-	mu      sync.Mutex
-	byKey   map[string]*modelAgg
-	latency *hdr
-	ttft    *hdr
-	prefill *hdr
-	decode  *hdr
-	tokens  *tokAcc
+	mu     sync.Mutex
+	byKey  map[string]*modelAgg
+	tokens *tokAcc
 }
 
+// modelAgg is one (backend, model). The histograms live here, not on modelStats,
+// because Prometheus emits them with backend and model labels: a shared
+// accumulator printed under every key is a fleet average wearing a model's name,
+// which is worse than no series at all - it looks like a measurement.
 type modelAgg struct {
 	Requests int64
 	Gen      int64
@@ -112,16 +112,26 @@ type modelAgg struct {
 	Cached   int64
 	TotalMs  float64
 	TTFTMs   float64
+
+	latency *hdr
+	ttft    *hdr
+	prefill *hdr
+	decode  *hdr
+}
+
+// newModelHDRs builds the four histograms for one key. The bounds are the useful
+// window for a generation on our boxes, not a guess about a cloud provider.
+func newModelHDRs() (latency, ttft, prefill, decode *hdr) {
+	return newHDR(50e3, 20*60e3), // 50ms .. 20min
+		newHDR(10, 10*60e3), // 10ms .. 10min
+		newHDR(1, 10*60e3), // prefill of a long prompt is not fast
+		newHDR(1, 20*60e3)
 }
 
 func newModelStats() *modelStats {
 	return &modelStats{
-		byKey:   map[string]*modelAgg{},
-		latency: newHDR(50e3, 20*60e3), // 50ms .. 20min, the useful window for a generation
-		ttft:    newHDR(10, 10*60e3),   // 10ms .. 10min
-		prefill: newHDR(1, 10*60e3),    // prefill of a long prompt is not fast
-		decode:  newHDR(1, 20*60e3),
-		tokens:  newTokAcc(),
+		byKey:  map[string]*modelAgg{},
+		tokens: newTokAcc(),
 	}
 }
 
@@ -142,6 +152,7 @@ func (m *modelStats) observe(rec *callRecord) {
 	a := m.byKey[k]
 	if a == nil {
 		a = &modelAgg{}
+		a.latency, a.ttft, a.prefill, a.decode = newModelHDRs()
 		m.byKey[k] = a
 	}
 	a.Requests++
@@ -165,15 +176,15 @@ func (m *modelStats) observe(rec *callRecord) {
 	if rec.CachedTokens != nil {
 		a.Cached += int64(*rec.CachedTokens)
 	}
-	m.latency.add(rec.TotalMs)
+	a.latency.add(rec.TotalMs)
 	if rec.TTFTMs > 0 {
-		m.ttft.add(rec.TTFTMs)
+		a.ttft.add(rec.TTFTMs)
 	}
 	if rec.PrefillMs != nil {
-		m.prefill.add(*rec.PrefillMs)
+		a.prefill.add(*rec.PrefillMs)
 	}
 	if rec.DecodeMs != nil {
-		m.decode.add(*rec.DecodeMs)
+		a.decode.add(*rec.DecodeMs)
 	}
 	m.tokens.add(rec)
 }
@@ -428,27 +439,22 @@ func (e *eventRing) stale(after int64) bool {
 // modelSnapshot copies the aggregates out under the lock, so emitting text never
 // holds it while a generation is finishing.
 type modelSnapshot struct {
-	byKey   map[string]*modelAgg
-	latency *hdr
-	ttft    *hdr
-	prefill *hdr
-	decode  *hdr
-	tokens  map[string]*tokRow
+	byKey  map[string]*modelAgg
+	tokens map[string]*tokRow
 }
 
 func (m *modelStats) snapshot() modelSnapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := modelSnapshot{
-		byKey:   make(map[string]*modelAgg, len(m.byKey)),
-		latency: m.latency.clone(),
-		ttft:    m.ttft.clone(),
-		prefill: m.prefill.clone(),
-		decode:  m.decode.clone(),
-		tokens:  make(map[string]*tokRow, len(m.tokens.by)),
+		byKey:  make(map[string]*modelAgg, len(m.byKey)),
+		tokens: make(map[string]*tokRow, len(m.tokens.by)),
 	}
 	for k, a := range m.byKey {
 		cp := *a
+		// The counts slice is shared by value, so a shallow copy would let a
+		// generation finishing during emission mutate a printed histogram.
+		cp.latency, cp.ttft, cp.prefill, cp.decode = a.latency.clone(), a.ttft.clone(), a.prefill.clone(), a.decode.clone()
 		out.byKey[k] = &cp
 	}
 	for k, row := range m.tokens.by {
@@ -474,11 +480,14 @@ func (r *Router) promModels(w http.ResponseWriter) {
 	}
 	sort.Strings(keys)
 
-	h := func(name, help string, hgs ...*hdr) {
+	h := func(name, help string, sel func(*modelAgg) *hdr) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
 		for _, k := range keys {
 			backend, model := splitModelKey(k)
-			for _, hg := range hgs {
+			for _, hg := range []*hdr{sel(s.byKey[k])} {
+				if hg == nil {
+					continue
+				}
 				var cum int64
 				for i, c := range hg.counts {
 					cum += c
@@ -496,10 +505,10 @@ func (r *Router) promModels(w http.ResponseWriter) {
 		}
 	}
 
-	h("rooter_model_duration_seconds", "Time from request to a finished response, per backend and model", s.latency)
-	h("rooter_model_ttft_seconds", "Time from request to the first response byte, per backend and model", s.ttft)
-	h("rooter_model_prefill_seconds", "Prompt evaluation time reported by the runner", s.prefill)
-	h("rooter_model_decode_seconds", "Token generation time reported by the runner", s.decode)
+	h("rooter_model_duration_seconds", "Time from request to a finished response, per backend and model", func(a *modelAgg) *hdr { return a.latency })
+	h("rooter_model_ttft_seconds", "Time from request to the first response byte, per backend and model", func(a *modelAgg) *hdr { return a.ttft })
+	h("rooter_model_prefill_seconds", "Prompt evaluation time reported by the runner", func(a *modelAgg) *hdr { return a.prefill })
+	h("rooter_model_decode_seconds", "Token generation time reported by the runner", func(a *modelAgg) *hdr { return a.decode })
 
 	e := func(name, help, typ string) {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, typ)
