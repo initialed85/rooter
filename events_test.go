@@ -173,3 +173,89 @@ func getEvents(t *testing.T, r *Router, target string) eventsPage {
 	}
 	return p
 }
+
+// rawEvents reads the endpoint as a consumer does - as JSON keys, not as Go fields -
+// because a rename is exactly the failure a struct-typed test cannot see.
+func rawEvents(t *testing.T, r *Router) []map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/rooter/events", nil)
+	rr := httptest.NewRecorder()
+	r.eventsJSON(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("/rooter/events: %d", rr.Code)
+	}
+	var envelope struct {
+		Events []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	return envelope.Events
+}
+
+// TestEventsPublishTheAccountingNamesAGateIsBuiltOn pins the prompt-accounting field
+// names on the /rooter/events wire. pi-ed arms an idle-compaction warm gate on
+// prompt_tokens_computed against cache_hit_rate, so the pair has to stay on the wire,
+// stay numerically consistent with each other, and - the part that is easy to break by
+// accident - keep publishing a hit rate of zero. These fields are pointer-typed with
+// omitempty, so a change to how they are filled can make a zero vanish, and a gate
+// reading "no cache_hit_rate key" as "fast" would then stop arming at exactly the
+// sessions that need it most.
+func TestEventsPublishTheAccountingNamesAGateIsBuiltOn(t *testing.T) {
+	r := newRingRouter(t, 16)
+
+	warm := rec("warm")
+	warm.PromptTokens, warm.PromptTokensComputed, warm.CachedTokens = loadInt(31000), loadInt(12000), loadInt(19000)
+	rate := 19000.0 / 31000.0
+	warm.CacheHitRate = &rate
+	r.events.push(warm)
+
+	cold := rec("cold")
+	cold.PromptTokens, cold.PromptTokensComputed, cold.CachedTokens = loadInt(40800), loadInt(40800), loadInt(0)
+	zero := 0.0
+	cold.CacheHitRate = &zero
+	r.events.push(cold)
+
+	none := rec("unmeasured")
+	r.events.push(none)
+
+	events := rawEvents(t, r)
+	if len(events) != 3 {
+		t.Fatalf("want 3 rows on the wire, got %d", len(events))
+	}
+	for _, key := range []string{"prompt_tokens", "prompt_tokens_computed", "cached_tokens", "cache_hit_rate"} {
+		for _, row := range events[:2] {
+			if _, ok := row[key]; !ok {
+				t.Fatalf("%s is missing from a row a consumer is gating on: %v", key, row)
+			}
+		}
+	}
+
+	// The pair has to agree, because a gate that reads both is only as good as the
+	// identity between them.
+	for _, row := range events[:2] {
+		prompt := row["prompt_tokens"].(float64)
+		computed := row["prompt_tokens_computed"].(float64)
+		cached := row["cached_tokens"].(float64)
+		hit := row["cache_hit_rate"].(float64)
+		if cached+computed != prompt {
+			t.Errorf("cached(%v) + computed(%v) != prompt(%v) on %v", cached, computed, prompt, row["id"])
+		}
+		if !near(hit, cached/prompt, 0.001) {
+			t.Errorf("cache_hit_rate %v is not cached/prompt (%v) on %v", hit, cached/prompt, row["id"])
+		}
+	}
+
+	// A zero hit rate is a published fact, not an absent one: that row is the arm case.
+	if events[1]["cache_hit_rate"] != float64(0) {
+		t.Errorf("the fully cold row published cache_hit_rate %#v, want an explicit 0", events[1]["cache_hit_rate"])
+	}
+
+	// And a call rooter never measured publishes none of them, so "unknown" stays
+	// distinguishable from "cold".
+	for _, key := range []string{"prompt_tokens", "prompt_tokens_computed", "cached_tokens", "cache_hit_rate"} {
+		if _, ok := events[2][key]; ok {
+			t.Errorf("an unmeasured row published %s: %v", key, events[2])
+		}
+	}
+}

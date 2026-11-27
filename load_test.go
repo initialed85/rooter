@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -390,5 +391,133 @@ func TestBackendsFieldContractIsWhatCallersDependOn(t *testing.T) {
 	}
 	if got, _ := field(t, doc, "slotsFree"); got != 1 {
 		t.Errorf("slotsFree = %v on an idle default-width backend, want 1", doc["slotsFree"])
+	}
+}
+
+// TestEstimatesAreTheArithmeticAPiDeadlineIsSizedFrom pins the estimate block on
+// /rooter/backends, because pi-ed is now converting prompt tokens into a wall-clock
+// budget with these numbers (compaction deadline sizing), and two of the three
+// bounds disagree by design: estFirstByteFreeMs assumes the box takes the work now,
+// estFirstByteQueuedMs assumes it finishes what it is holding first. A deadline sized
+// against the free one is a deadline that gets missed, so the ordering of the three is
+// the contract - and so is the absence, because a box rooter has never seen prefill a
+// large prompt gets no estimate at all rather than a flattering one.
+func TestEstimatesAreTheArithmeticAPiDeadlineIsSizedFrom(t *testing.T) {
+	a := newFake(t, "a", "test-model", "")
+	e := newEnv(t, []string{"a=" + a.url() + ",concurrency=4", "b=" + newFake(t, "b", "test-model", "").url()}, func(c *Config) { c.RequestTimeout = 0 })
+
+	// Seed exactly one cold sample so the EWMA equals a number whose truth is known:
+	// 40,500 tokens evaluated in 16.2 s of post-handoff time = 2,500 tok/s.
+	e.pool.ObserveLoad(&callRecord{
+		Backend: "a", TTFTMs: 16200, WaitMs: 0,
+		PromptTokens: loadInt(40500), PromptTokensComputed: loadInt(40500),
+	})
+
+	const promptBytes = 200000
+	ownTokens := float64(promptBytes) / BytesPerToken // 49,383 tokens
+
+	_, raw := e.do(get("/rooter/backends?promptBytes=" + strconv.Itoa(promptBytes)))
+	doc := docByName(backendsDoc(t, raw), "a")
+	if doc == nil {
+		t.Fatalf("no backend a in %s", raw)
+	}
+	for _, key := range []string{"coldPrefillTokS", "queuedTokens", "ownTokens",
+		"estFirstByteFreeMs", "estFirstByteQueuedMs", "estFirstByteMaxSlotMs"} {
+		if _, ok := doc[key]; !ok {
+			t.Fatalf("%s is missing from /rooter/backends?promptBytes=...; a caller is sizing a deadline from it: %s", key, raw)
+		}
+	}
+	coldTokS, _ := field(t, doc, "coldPrefillTokS")
+	if !near(coldTokS, 2500, 0.01) {
+		t.Fatalf("coldPrefillTokS = %v, want the seeded 2500", coldTokS)
+	}
+	own, _ := field(t, doc, "ownTokens")
+	if !near(own, ownTokens, 0.001) {
+		t.Errorf("ownTokens = %v, want the requested prompt at BytesPerToken (%v)", own, ownTokens)
+	}
+
+	// Nothing queued yet: all three bounds collapse onto one number, and that number
+	// is the prompt's own cost at the box's cold rate.
+	free, _ := field(t, doc, "estFirstByteFreeMs")
+	queued, _ := field(t, doc, "estFirstByteQueuedMs")
+	maxSlot, _ := field(t, doc, "estFirstByteMaxSlotMs")
+	if !near(free, ownTokens/coldTokS*1000, 0.01) {
+		t.Errorf("estFirstByteFreeMs = %v, want %v (ownTokens / coldPrefillTokS)", free, ownTokens/coldTokS*1000)
+	}
+	if queued != free || maxSlot != free {
+		t.Errorf("on a box holding nothing every bound is the same wait: free=%v queued=%v maxSlot=%v", free, queued, maxSlot)
+	}
+	if got, _ := field(t, doc, "queuedTokens"); got != 0 {
+		t.Errorf("queuedTokens = %v on a box holding nothing, want 0", got)
+	}
+
+	// Now the box is holding two prompts: 10,000 tokens and 20,000 tokens. queued is
+	// the sum (the reading a deadline should be sized from), maxSlot is only the
+	// longest single one (the reading that holds if the box runs its slots in
+	// parallel), and free ignores both. They must never collapse or invert.
+	b := e.pool.Lookup("a")
+	if b == nil {
+		t.Fatal("Lookup(a) found nothing")
+	}
+	id1 := e.pool.BeginFlight(b, 40500)
+	id2 := e.pool.BeginFlight(b, 81000)
+	_, raw = e.do(get("/rooter/backends?promptBytes=" + strconv.Itoa(promptBytes)))
+	doc = docByName(backendsDoc(t, raw), "a")
+	qTok, _ := field(t, doc, "queuedTokens")
+	free2, _ := field(t, doc, "estFirstByteFreeMs")
+	queued2, _ := field(t, doc, "estFirstByteQueuedMs")
+	max2, _ := field(t, doc, "estFirstByteMaxSlotMs")
+	// queuedTokens is the backlog alone - the work already handed over - while every
+	// est*Ms adds the asked-for prompt on top of it. Conflating the two is the obvious
+	// way to read a queued estimate as half its real size, so it is pinned here.
+	if !near(qTok, 30000, 0.02) {
+		t.Errorf("queuedTokens = %v, want the two bodies already in flight (30,000 tokens), without the prompt being asked about", qTok)
+	}
+	if !(free2 <= max2 && max2 < queued2) {
+		t.Errorf("bounds wrong: free=%v maxSlot=%v queued=%v; want free <= maxSlot < queued when the backlog is more than one request, because a deadline sized on the wrong one is missed by up to the whole backlog", free2, max2, queued2)
+	}
+	if !near(queued2, (qTok+ownTokens)/coldTokS*1000, 0.02) {
+		t.Errorf("estFirstByteQueuedMs = %v, want (queuedTokens + ownTokens) / coldPrefillTokS = %v", queued2, (qTok+ownTokens)/coldTokS*1000)
+	}
+	if !near(max2, (20000+ownTokens)/coldTokS*1000, 0.02) {
+		t.Errorf("estFirstByteMaxSlotMs = %v, want the longest single body (20,000) plus ownTokens at the cold rate = %v", max2, (20000+ownTokens)/coldTokS*1000)
+	}
+	if !near(free2, free, 0.001) {
+		t.Errorf("estFirstByteFreeMs moved from %v to %v: it is the box taking the work now, so it must not absorb the backlog", free, free2)
+	}
+
+	// Work the box has already overtaken counts as zero, never as a negative backlog:
+	// an hour-old body must not buy the next caller a discount it did not earn.
+	e.pool.mu.Lock()
+	for i := range b.inFlight {
+		b.inFlight[i].Since = time.Now().Add(-time.Hour)
+	}
+	e.pool.mu.Unlock()
+	ests := e.pool.Estimates(promptBytes)
+	if aged := ests["a"]; aged == nil {
+		t.Fatal("no estimate for a after ageing its backlog out")
+	} else if aged["queuedTokens"] != int64(0) {
+		t.Errorf("queuedTokens = %v with an hour-old backlog, want 0 rather than a negative credit", aged["queuedTokens"])
+	}
+	e.pool.EndFlight(b, id1)
+	e.pool.EndFlight(b, id2)
+
+	// Nobody asked, nothing published: an estimate answers a promptBytes the caller
+	// supplied, it is not a standing claim about the fleet.
+	if got := e.pool.Estimates(0); len(got) != 0 {
+		t.Errorf("Estimates(0) returned %d entries, want none", len(got))
+	}
+
+	// A box rooter has never seen prefill a large prompt gets no estimate at all.
+	// Absence is the case a caller has to read as unknown, never as fast.
+	_, raw = e.do(get("/rooter/backends?promptBytes=" + strconv.Itoa(promptBytes)))
+	doc = docByName(backendsDoc(t, raw), "b")
+	if doc == nil {
+		t.Fatal("no backend b")
+	}
+	for _, key := range []string{"coldPrefillTokS", "estFirstByteFreeMs", "estFirstByteQueuedMs", "estFirstByteMaxSlotMs"} {
+		if _, ok := doc[key]; ok {
+			t.Errorf("unobserved backend b published %s; the promise is that an estimate is a measurement: %v", key, doc)
+		}
 	}
 }
