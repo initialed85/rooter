@@ -384,6 +384,100 @@ func injectRooterObject(body []byte, rec any) ([]byte, bool) {
 	return out, true
 }
 
+// injectCacheWriteTokens extends the usage block of a non-streaming body with the
+// one number Pi prices cache against and no llama.cpp-family runner has ever emitted
+// on this fleet: usage.prompt_tokens_details.cache_write_tokens. Approved by Ed on
+// 2026-11-27 for exactly one reason - Pi maps cacheWrite from that field, so a
+// runner that never writes it makes every call look like a pure read, and "read=0
+// AND write=0" cannot tell a cache miss from a cache hit.
+//
+// The value is rooter's already-normalised prompt_tokens_computed, which is the
+// tokens the runner evaluated, and that is the right quantity under both prompt_n
+// conventions documented above: a runner that reports the work states it directly,
+// a runner that reports the prompt with the cached prefix still inside it has had
+// the prefix subtracted already. A warm call therefore reports a small write and a
+// cold call reports the whole prompt, which is what the field means.
+//
+// What this deliberately does not do: invent a usage block where the runner sent
+// none (a plain llama.cpp /completion answer has no OpenAI usage for anybody to
+// price), overwrite a runner that has started reporting the field itself, or touch a
+// streaming body, where rooter reads the tail and never rewrites it because those
+// bytes are the user's tokens arriving. It splices, like the rooter object does,
+// because adding one number to somebody else's response is a byte-level edit and a
+// remarshalled body would silently reorder and reformat the numbers the runner chose
+// to print.
+func injectCacheWriteTokens(body []byte, computed int) ([]byte, bool) {
+	if computed <= 0 {
+		return nil, false
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, false
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &top); err != nil {
+		return nil, false
+	}
+	usageRaw, ok := top["usage"]
+	if !ok || len(usageRaw) < 2 || usageRaw[0] != '{' {
+		return nil, false
+	}
+	// RawMessage is the exact source span, so the object can be found by its own
+	// bytes. If the same span appears twice, rooter cannot tell which one it is
+	// editing, and an ambiguous edit of a client's usage block is worse than none.
+	start := bytes.Index(trimmed, usageRaw)
+	if start < 0 || bytes.Index(trimmed[start+1:], usageRaw) >= 0 {
+		return nil, false
+	}
+
+	var usage map[string]json.RawMessage
+	if err := json.Unmarshal(usageRaw, &usage); err != nil {
+		return nil, false
+	}
+	field := []byte(`"cache_write_tokens":` + strconv.Itoa(computed))
+
+	if details, has := usage["prompt_tokens_details"]; has && len(details) >= 2 && details[0] == '{' {
+		var inner map[string]json.RawMessage
+		if err := json.Unmarshal(details, &inner); err != nil {
+			return nil, false
+		}
+		if _, exists := inner["cache_write_tokens"]; exists {
+			return nil, false // the runner answered for itself; do not argue
+		}
+		at := bytes.Index(usageRaw, details)
+		if at < 0 {
+			return nil, false
+		}
+		return spliceUsage(trimmed, start, usageRaw, addMember(usageRaw, at+len(details), field)), true
+	}
+
+	// No details object yet: create one, because that is where Pi looks. Rooter does
+	// not put the number loose in usage and hope the reader finds it.
+	nested := []byte(`"prompt_tokens_details":{` + string(field) + `}`)
+	return spliceUsage(trimmed, start, usageRaw, addMember(usageRaw, len(usageRaw), nested)), true
+}
+
+// addMember appends a member just inside the closing brace of the JSON object that
+// ends at `end` within obj, and leaves every byte the runner wrote untouched.
+func addMember(obj []byte, end int, member []byte) []byte {
+	out := make([]byte, 0, len(obj)+len(member)+1)
+	out = append(out, obj[:end-1]...)
+	if len(bytes.TrimRight(bytes.TrimLeft(obj[:end-1], "{ \t\n\r"), " \t\n\r")) > 0 {
+		out = append(out, ',') // the object already had a member in it
+	}
+	out = append(out, member...)
+	out = append(out, obj[end-1:]...)
+	return out
+}
+
+func spliceUsage(body []byte, start int, old, replaced []byte) []byte {
+	out := make([]byte, 0, len(body)+len(replaced)-len(old))
+	out = append(out, body[:start]...)
+	out = append(out, replaced...)
+	out = append(out, body[start+len(old):]...)
+	return out
+}
+
 // headerWriter sets rooter's headers. Every one of these is known before the
 // response starts, which is exactly why they are headers and not body fields.
 // roundMs is the single place a duration becomes a number a client reads.
@@ -546,7 +640,14 @@ func (r *Router) finishRecord(w *replyWriter, rec *callRecord, res *attempt, b *
 		if w.buffering {
 			// A held body is complete, so read all of it rather than a tail.
 			rec.absorbJSON(w.buf)
+			computed := 0
+			if rec.PromptTokensComputed != nil {
+				computed = *rec.PromptTokensComputed
+			}
 			w.hook = func(in []byte) []byte {
+				if injected, ok := injectCacheWriteTokens(in, computed); ok {
+					in = injected
+				}
 				if injected, ok := injectRooterObject(in, rec); ok {
 					return injected
 				}

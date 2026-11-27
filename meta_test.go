@@ -249,6 +249,12 @@ func TestStreamIsPassedThroughByteForByte(t *testing.T) {
 	if strings.Contains(string(all), `"rooter"`) {
 		t.Errorf("rooter injected into a live stream:\n%s", all)
 	}
+	// The same rule holds for the usage number rooter adds to a held body: a stream
+	// is read from the tail and never rewritten, so a streaming client gets exactly
+	// the bytes the runner chose to send and nothing rooter computed after the fact.
+	if strings.Contains(string(all), "cache_write_tokens") {
+		t.Errorf("rooter rewrote a live stream to publish a number it could only read from the tail:\n%s", all)
+	}
 	if strings.Count(string(all), "data: ") != 3 {
 		t.Errorf("the stream gained or lost events:\n%s", all)
 	}
@@ -824,5 +830,135 @@ func TestWhitespaceAfterTheColonIsNotOptional(t *testing.T) {
 	// A real keep-alive line, which is the other thing that travels between deltas.
 	if at := firstContentOffset([]byte(": keep-alive")); at >= 0 {
 		t.Error("a keep-alive comment looked like content")
+	}
+}
+
+// cacheWriteFake answers a non-streaming completion whose timings rooter has to read
+// the runner's way rather than the field name's way, which is the whole reason the
+// field it emits is prompt_tokens_computed and not prompt_tokens.
+func cacheWriteFake(t *testing.T, name, model string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok") })
+	mux.HandleFunc("/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[{"id":"`+model+`"}]}`)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		text := string(body)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(text, "cold"):
+			// strata's convention: prompt_n is the work done. 40,000 tokens in 20 s
+			// is 2,000 tok/s, which is exactly what the runner states, so rooter
+			// prices the write against all 40,000.
+			io.WriteString(w, `{"model":"`+model+`","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],`+
+				`"usage":{"prompt_tokens":40000,"completion_tokens":20},`+
+				`"timings":{"prompt_n":40000,"prompt_ms":20000,"prompt_per_second":2000,"predicted_n":20,"predicted_ms":400}}`)
+		case strings.Contains(text, "warm"):
+			// sushi's convention: prompt_n is the prompt with the cached prefix still
+			// inside it. 40,000 tokens with 39,900 of them already in the KV cache,
+			// evaluated in 1 s, states 100 tok/s - and only (40,000 - 39,900)/1 s
+			// reproduces that, so the write rooter reports is 100, not 40,000.
+			io.WriteString(w, `{"model":"`+model+`","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],`+
+				`"usage":{"prompt_tokens":40000,"completion_tokens":20},`+
+				`"timings":{"prompt_n":40000,"cached_n":39900,"prompt_ms":1000,"prompt_per_second":100,"predicted_n":20,"predicted_ms":400}}`)
+		case strings.Contains(text, "already"):
+			// A runner that has started reporting the field answers for itself.
+			io.WriteString(w, `{"model":"`+model+`","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],`+
+				`"usage":{"prompt_tokens":40000,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":39900,"cache_write_tokens":7}},`+
+				`"timings":{"prompt_n":40000,"cached_n":39900,"prompt_ms":1000,"prompt_per_second":100,"predicted_n":20,"predicted_ms":400}}`)
+		default:
+			// No usage block at all: a plain llama.cpp /completion shape. rooter does
+			// not create an OpenAI usage block in somebody else's response.
+			io.WriteString(w, `{"model":"`+model+`","choices":[{"message":{"content":"hi"},"finish_reason":"stop"}],`+
+				`"timings":{"prompt_n":40000,"prompt_ms":20000,"prompt_per_second":2000,"predicted_n":20,"predicted_ms":400}}`)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestCacheWriteTokensReachesTheClientWhoPricesIt is the emission Ed approved on
+// 2026-11-27, scoped to exactly what he approved: Pi reads cacheWrite from
+// usage.prompt_tokens_details.cache_write_tokens, no llama.cpp-family runner on this
+// fleet has ever written that field, so cacheWrite has been structurally 0 and
+// "read=0 and write=0" could not tell a miss from a hit. Routing, affinity and the
+// tier do not move here - this adds one number to a body rooter already passes
+// through, and nothing about where the request went.
+func TestCacheWriteTokensReachesTheClientWhoPricesIt(t *testing.T) {
+	s := cacheWriteFake(t, "box", "qwen-model")
+	e := newEnv(t, []string{"box=" + s.URL}, nil)
+	e.pool.CheckAll()
+
+	type usageDoc struct {
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			Details          struct {
+				CachedTokens     *int `json:"cached_tokens"`
+				CacheWriteTokens *int `json:"cache_write_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+
+	read := func(prompt string) usageDoc {
+		t.Helper()
+		_, out := e.do(postJSON("/v1/chat/completions",
+			`{"model":"auto","messages":[{"role":"user","content":"`+prompt+` aaaaaaaaaa"}]}`))
+		var doc usageDoc
+		if err := json.Unmarshal([]byte(out), &doc); err != nil {
+			t.Fatalf("body is not valid JSON after adding cache_write_tokens: %v\n%s", err, out)
+		}
+		return doc
+	}
+
+	cold := read("cold")
+	if cold.Usage.Details.CacheWriteTokens == nil {
+		t.Fatalf("no cache_write_tokens in the body a warm or cold call answers with: %v", cold)
+	}
+	if *cold.Usage.Details.CacheWriteTokens != 40000 {
+		t.Errorf("a cold 40,000 token prompt reported cache_write_tokens %d, want the whole prompt evaluated",
+			*cold.Usage.Details.CacheWriteTokens)
+	}
+	if cold.Usage.PromptTokens != 40000 || cold.Usage.CompletionTokens != 20 {
+		t.Errorf("rooter changed the runner's own usage numbers: %+v", cold.Usage)
+	}
+
+	warm := read("warm")
+	if warm.Usage.Details.CacheWriteTokens == nil {
+		t.Fatalf("no cache_write_tokens on a warm restore: %v", warm)
+	}
+	if *warm.Usage.Details.CacheWriteTokens != 100 {
+		t.Errorf("a warm restore of 39,900 tokens reported cache_write_tokens %d, want 100: the write is the part that had to be evaluated, and this runner's prompt_n still has the cached prefix inside it",
+			*warm.Usage.Details.CacheWriteTokens)
+	}
+	if *warm.Usage.Details.CacheWriteTokens >= *cold.Usage.Details.CacheWriteTokens {
+		t.Errorf("cache_write_tokens cannot separate a miss from a hit: warm wrote %d, cold wrote %d",
+			*warm.Usage.Details.CacheWriteTokens, *cold.Usage.Details.CacheWriteTokens)
+	}
+	if warm.Usage.PromptTokens != 40000 {
+		t.Errorf("the same 40,000 token prompt must still read 40,000 prompt_tokens when it is warm: %d",
+			warm.Usage.PromptTokens)
+	}
+
+	// A runner that reports the field itself is not overwritten, and a response with
+	// no usage block gets no usage block invented.
+	already := read("already")
+	if already.Usage.Details.CacheWriteTokens == nil || *already.Usage.Details.CacheWriteTokens != 7 {
+		t.Errorf("rooter argued with a runner that already wrote cache_write_tokens: %v", already.Usage.Details)
+	}
+	if already.Usage.Details.CachedTokens == nil || *already.Usage.Details.CachedTokens != 39900 {
+		t.Errorf("the runner's own cached_tokens was disturbed: %v", already.Usage.Details)
+	}
+
+	_, out := e.do(postJSON("/v1/chat/completions", `{"model":"auto","messages":[{"role":"user","content":"bare"}]}`))
+	if strings.Contains(out, "cache_write_tokens") {
+		t.Errorf("rooter wrote cache_write_tokens into a body that has no usage block: %s", out)
+	}
+	if strings.Contains(out, `"usage"`) {
+		t.Errorf("rooter created a usage block the runner never sent: %s", out)
 	}
 }
