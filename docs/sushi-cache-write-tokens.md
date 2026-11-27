@@ -1,10 +1,20 @@
 # sushi should emit `usage.prompt_tokens_details.cache_write_tokens`
 
 **Status: prepared, not applied.** This is a spec with measured grounding, left here for Ed. sushi's
-source is not in the fleet workspace — what exists is the binary
-`/Users/edwardbeech/sushi-macos-arm64/sushi` (17,903,936 bytes, `sushi 1.5.1`, `mlx 0.32.3`,
-`mlx-c 56b2d39fc831`) — so no source patch can be written from here, and I have changed nothing on
-the box except the prefix-cache sizing that Ed approved. Written 2026-11-27 11:45Z (19:45 AWST).
+source is not in the fleet workspace — what exists is the release bundle
+`/Users/edwardbeech/sushi-macos-arm64/` (`sushi` 17,903,936 bytes, `sushi 1.5.1`, `mlx 0.32.3`,
+`mlx-c 56b2d39fc831`, `sushibar`, `guest.json`, `lib/*.dylib`) — and the upstream the binary reports
+is **https://github.com/beamivalice/sushi** (that URL is embedded in the binary's strings), so the
+edit belongs upstream, not in a patch written from a binary. What is written below is the exact field
+path and the exact source of the value, stated against the response object sushi actually emits,
+which is the part both of us can verify. I have changed nothing on the box except the prefix-cache
+sizing Ed approved. Written 2026-11-27 11:45Z (19:45 AWST), updated 13:15Z after the restart landed.
+
+Evidence that the field does not already exist: `strings` over the binary matches `cache_write` in
+the *metrics* names (`prefix_cache_write_bytes_total`, `prefix_cache_write_failed_bytes_total`) and
+nowhere in a usage or chunk serialiser. The usage serialiser's literal is
+`"usage":{"prompt_tokens":,"prompt_tokens_details":{"cached_tokens":,"completion_tokens_details":{`
+— exactly one count inside `prompt_tokens_details`, which is where this one goes.
 
 ## The gap, and who is currently papering over it
 
@@ -113,9 +123,11 @@ Measured on sushi, 2026-11-27, from rooter's load accounting (`/rooter/backends`
   cheaper to have than to recompute, which is the entire reason the field matters;
 - a warm session whose prefix is evicted pays its whole window again: **179–248 s** for the 43–60k
   token prompts that post-compaction sessions actually carry at 242 tok/s;
-- today's real capacity-eviction misses cost **75–78 s** of prefill each. Those were evictions on a
-  box with 16 days 10 hours of uptime, not the cost of a restart — the restart had not happened as
-  of this writing;
+- capacity-eviction misses measured before the restart cost **75–78 s** of prefill each, on a box
+  with 16 days 10 hours of uptime. Those were capacity evictions, not restart cost, and that
+  attribution stands. After the restart (12:07:08Z) a cold prefill of a 33,761-token prefix took
+  **74 s** of wall time, about 456 tok/s including whatever it queued behind — so the 242 tok/s EWMA
+  is conservative in the direction a deadline needs;
 - prefix-cache tier reality behind those misses, at 11:37Z: hot restores 10,340 against hot
   evictions 1,298; SSD restores **66** against SSD evictions **3,791**; `disk_used_bytes`
   4,201,208,903 against a 4,294,967,296 budget, i.e. 97.8% full. The SSD tier is writing a great
@@ -127,10 +139,31 @@ Measured on sushi, 2026-11-27, from rooter's load accounting (`/rooter/backends`
 1.18 TB, qsa 0.63 TB, spec 0.40 TB, meta 0.0009 TB, ring 0) against 72.4 GB free on the Data volume
 holding `~/.sushi/kv-cache`. Roughly 275 GB/day of writes on the volume.
 
-Emitting a field changes none of that: it reports work sushi already does. The sizing change Ed
-approved (entry cap 4 to 12, SSD budget 4 GiB to 8 GiB) does change it, in the direction of fewer
-evictions per byte of budget; the honest statement is that it will be measured rather than assumed,
-and `disk_written_bytes` is the counter to watch.
+Emitting a field changes none of that: it reports work sushi already does.
+
+### Measured, not assumed: the sizing change is applied and the write rate went up
+
+The sizing Ed approved (entry cap 4 → 12, SSD budget 4 GiB → 8 GiB, `mem_bytes` unchanged) went live
+at 12:07:08Z. Over the first 63 minutes on the new settings:
+
+```
+hot restores 143 / hot evictions 6      (before: 10,365 / 1,308 over 16.4 d — ratio 7.9 → 23.8)
+SSD restores   2 / SSD evictions 18     (before:     66 / 3,799            — ratio 0.017 → 0.11)
+requests 152 in 63 min (143/h against 28.4/h before), query-level hit rate 93.6% (was 92.9%)
+disk_used oscillating 5.24 – 8.56 GB against the new 8 GiB ceiling, above the old 4.29 GiB budget
+   from ~15 minutes in
+disk_written 31,069,016,691 in 63 min = 29.4 GB/h = ~706 GB/day  (was ~268 GB/day)
+```
+
+So the honest sentence for the wear question is: **the SSD tier writes roughly 2.6× faster than it
+did before the sizing change**, `~/.sushi/kv-cache` is now 11 GB, and `/System/Volumes/Data` reads
+832 GiB used of 926 GiB — 57 GiB available, 94% full, against 72.4 GB free before. The bigger budget
+is a claim on volume space, and the write-rate increase is its price. What the extra budget has
+bought is not yet a rate: of the 2 SSD restores in that hour one was my own probe, so the fleet
+number for the first hour is **one SSD restore**, and the judgement belongs on tomorrow's counters
+(`sushi:prefix_cache_tier_hits_total{tier="ssd"}` against the `{tier="ssd"}` evictions over a
+comparable traffic day). Full accounting, including the restart gate and the window chosen, is in
+`docs/sushi-prefix-cache-applied-20261127.md`.
 
 ## What rooters side of this needs, if sushi emits it
 
