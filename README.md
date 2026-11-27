@@ -309,6 +309,23 @@ Everything under `/rooter/` belongs to rooter; every other path is proxied. If
   a failed probe as well as a passing one, because "last checked a moment ago, and
   it failed" is the useful reading — a frozen `checked` looks identical to "nobody
   is polling this box".
+- `GET /rooter/backends` also reports **load**, which is a different question from
+  health: `inflight`, `inflightBytes`, `maxInflightBytes` and `oldestInflightMs`
+  describe the prompt bodies rooter has handed to that box and not yet taken back,
+  `slotsFree` is `concurrency - busy`, and `coldPrefillTokS` / `restoreTokS` are two
+  rates measured from finished calls and never averaged together — the first is
+  tokens per second of evaluating a prompt the runner had never seen, the second is
+  tokens per second of reading back a prefix it had, which is an order of magnitude
+  faster on both boxes here. A box with no cold sample yet reports neither rather
+  than guessing.
+  Ask the harder question with `?promptBytes=N` (or `?promptTokens=N`) and each
+  measured backend gains `queuedTokens`, `ownTokens`, `estFirstByteFreeMs` and
+  `estFirstByteQueuedMs`: what a request of that size would wait for its first byte
+  if the box picks it up now, and if it finishes what it is holding first. Both are
+  published because rooter knows its own slots and not the runner's — a 1-slot box
+  serialising three prompts and a 4-slot box running them in parallel both read as
+  "busy 3 of 4" from here — and a caller sizing a deadline should size it against
+  the queued one.
 - `GET /rooter/metrics` — Prometheus gauges and counters, plus per-`(backend,
   model)` families: `rooter_model_duration_seconds`, `_ttft_seconds`,
   `_prefill_seconds`, `_decode_seconds` histograms, `_requests_total`,

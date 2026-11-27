@@ -37,6 +37,31 @@ type Backend struct {
 	Requests    int64
 	Errors      int64
 	TotalWait   time.Duration
+
+	// Load, as opposed to health. Health says a box answers probes; load says what
+	// it is holding right now and how fast it has been turning fresh prompt tokens
+	// into a first byte. Both are needed before a caller commits a big request: a
+	// 100k-token prompt on an idle box and the same prompt behind two others on the
+	// same box are 40 s and 160 s apart, and nothing in a health check separates them.
+	inFlight []inFlightReq
+
+	// ColdTokS is an EWMA of prompt_tokens_computed per second of post-handoff time
+	// for calls that were genuinely cold (the runner evaluated most of the prompt).
+	// It is the rate a fresh prompt will be charged at. RestoreTokS is the same for
+	// warm calls, and is one to two orders of magnitude larger: it is the speed of
+	// reading a parked prefix, not of evaluating a new one. Keeping them apart is
+	// the whole point - averaging them would produce a number that describes neither.
+	ColdTokS     float64
+	ColdSamples  int
+	RestoreTokS  float64
+	RestoreSamps int
+}
+
+// inFlightReq is one body rooter has handed to a backend and not yet taken back.
+type inFlightReq struct {
+	ID    int64
+	Bytes int64
+	Since time.Time
 }
 
 func (b *Backend) busy() int { return len(b.sem) }
@@ -70,6 +95,7 @@ func (b *Backend) MarshalJSON() ([]byte, error) {
 		"url":         b.Base.String(),
 		"concurrency": b.Concurrency,
 		"busy":        b.busy(),
+		"slotsFree":   b.free(),
 		"healthy":     b.Healthy,
 		"models":      models,
 		"lastUsed":    b.LastUsed,
@@ -85,6 +111,33 @@ func (b *Backend) MarshalJSON() ([]byte, error) {
 	}
 	if !b.DownSince.IsZero() {
 		out["downSince"] = b.DownSince
+	}
+	// Load is reported as what is there now, so an idle box says 0 rather than
+	// omitting the field: "nothing queued" is the answer a caller is looking for.
+	out["inflight"] = len(b.inFlight)
+	var sum, max int64
+	oldest := time.Time{}
+	for _, f := range b.inFlight {
+		sum += f.Bytes
+		if f.Bytes > max {
+			max = f.Bytes
+		}
+		if oldest.IsZero() || f.Since.Before(oldest) {
+			oldest = f.Since
+		}
+	}
+	out["inflightBytes"] = sum
+	out["maxInflightBytes"] = max
+	if !oldest.IsZero() {
+		out["oldestInflightMs"] = time.Since(oldest).Milliseconds()
+	}
+	if b.ColdSamples > 0 {
+		out["coldPrefillTokS"] = round1(b.ColdTokS)
+		out["coldSamples"] = b.ColdSamples
+	}
+	if b.RestoreSamps > 0 {
+		out["restoreTokS"] = round1(b.RestoreTokS)
+		out["restoreSamples"] = b.RestoreSamps
 	}
 	return json.Marshal(out)
 }

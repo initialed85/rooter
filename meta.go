@@ -129,6 +129,13 @@ type callRecord struct {
 	CacheHitRate         *float64 `json:"cache_hit_rate,omitempty"`
 	FinishReason         string   `json:"finish_reason,omitempty"`
 
+	// flightID and flightBackend are rooter's own in-flight bookkeeping, not part of
+	// the record: unexported, so they never reach the event ring or a client. They
+	// ride on the record because the record is the one thing that survives every path
+	// out of a proxied request, including the abandoned one.
+	flightID      int64
+	flightBackend *Backend
+
 	// Extra is the upstream's own timings object, verbatim. Rooter normalises the
 	// fields above and keeps nothing of the source shape, so anything it does not
 	// model is still recoverable - which matters because our runners have disagreed

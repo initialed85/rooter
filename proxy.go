@@ -304,6 +304,14 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if info.Resolved != "" {
 		rec.Model = info.Resolved // a backend-name alias: the client asked for the box
 	}
+	// Note what is about to be handed over, before the hand-over. The point of the
+	// note is the next caller: /rooter/backends can only say "this box is holding
+	// 160 KB of prompt, and the oldest of them has been there 40 s" if the bodies in
+	// flight were recorded when they started, rather than inferred afterwards from a
+	// busy count that says nothing about the size of the work.
+	if slot {
+		r.beginFlight(rec, held, len(body))
+	}
 	rw := &replyWriter{ResponseWriter: w, started: start, mayBuffer: !r.cfg.NoMeta,
 		maxTail: r.cfg.MetaTail, maxBuf: int(r.cfg.MaxBody)}
 
@@ -344,6 +352,27 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	res = r.dispatch(ctx, rw, req, &held, body, partial, info, &out, slot, rec)
 }
 
+// beginFlight and endFlight bracket one generation in rooter's load view of a
+// backend. They live on the record rather than in a local variable because a
+// retried request changes boxes mid-flight, and the note has to follow the request
+// to whichever box ends up answering - otherwise a retry leaves a phantom body
+// queued on a box that has already let go of it.
+func (r *Router) beginFlight(rec *callRecord, b *Backend, bytes int) {
+	if rec == nil || b == nil || bytes <= 0 {
+		return
+	}
+	rec.flightID = r.pool.BeginFlight(b, int64(bytes))
+	rec.flightBackend = b
+}
+
+func (r *Router) endFlight(rec *callRecord) {
+	if rec == nil || rec.flightBackend == nil {
+		return
+	}
+	r.pool.EndFlight(rec.flightBackend, rec.flightID)
+	rec.flightBackend, rec.flightID = nil, 0
+}
+
 // settle closes the books on one proxied exchange. It runs on the normal path
 // and on the panic path, so it must not assume anything about how far dispatch
 // got. Returns the attempt through res so the caller sees the final status.
@@ -367,6 +396,11 @@ func (r *Router) settle(w *replyWriter, req *http.Request, res *attempt, b *Back
 		r.aborted++
 	}
 	r.mu.Unlock()
+
+	// First thing, before anything that can return: this is the only place the
+	// in-flight note is guaranteed to be cleared, because settle runs on the panic
+	// path as well as the normal one.
+	r.endFlight(rec)
 
 	// Finish the record before releasing a held body, so the object the client
 	// sees is the same one rooter keeps.
@@ -446,7 +480,14 @@ func (r *Router) dispatch(ctx context.Context, w *replyWriter, req *http.Request
 		if slot {
 			r.pool.Release(b)
 		}
+		// The body moved boxes, so the load note has to move with it. Leaving the note
+		// on the box that gave up would keep it "busy" with work it is not doing, and
+		// the estimate built from it would be invented.
+		r.endFlight(rec)
 		*hold = nb
+		if slot {
+			r.beginFlight(rec, nb, len(body))
+		}
 		out.Backend = nb
 		out.Waited += o2.Waited
 		out.Rebound = true

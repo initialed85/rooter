@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,6 +36,13 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 			errJSON(w, http.StatusInternalServerError, "backends: "+err.Error())
 			return
 		}
+		// ?promptBytes=N (or ?promptTokens=N) asks the question a deadline is actually
+		// sized from: not "how busy is this box" but "how long would *my* prompt wait
+		// behind what is already on it". Only rooter can answer it, because only rooter
+		// both knows the size of a request and is the thing that hands it out.
+		if want := wantPromptBytes(req); want > 0 {
+			b = r.pool.MergeEstimates(b, want)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(b)
 	case "rooter/sessions":
@@ -53,6 +61,25 @@ func (r *Router) admin(w http.ResponseWriter, req *http.Request) {
 	default:
 		errJSON(w, http.StatusNotFound, "not found: "+req.URL.Path)
 	}
+}
+
+// wantPromptBytes reads the size a caller is asking about. promptBytes is the
+// literal body size rooter would see; promptTokens is the friendlier spelling and
+// is converted through BytesPerToken. Unparsable or absent means "just tell me the
+// load", which is the common case and costs the endpoint nothing.
+func wantPromptBytes(req *http.Request) int64 {
+	q := req.URL.Query()
+	if v := strings.TrimSpace(q.Get("promptBytes")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("promptTokens")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return int64(float64(n) * BytesPerToken)
+		}
+	}
+	return 0
 }
 
 // metricsOnly is the entirety of a second, keyless listener: the Prometheus

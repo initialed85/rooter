@@ -49,10 +49,13 @@ type Pool struct {
 	renamed  map[string]string // lowercased retired name -> the live backend it now means
 	formers  []Renaming        // as configured, for the catalog and /rooter/stats
 	release  chan struct{}     // closed and replaced whenever a slot frees or state changes
-	opts     PoolOpts
-	meta     map[string]bool // normalized MetaModels, fixed at start
-	client   *http.Client
-	log      *log.Logger
+	// nextFlightID labels one in-flight body, so the note can be cleared by the
+	// request that made it even after that request has changed boxes.
+	nextFlightID int64
+	opts         PoolOpts
+	meta         map[string]bool // normalized MetaModels, fixed at start
+	client       *http.Client
+	log          *log.Logger
 }
 
 func NewPool(backends []*Backend, opts PoolOpts, client *http.Client, logger *log.Logger) *Pool {
@@ -573,6 +576,182 @@ func (p *Pool) Release(b *Backend) {
 	p.mu.Lock()
 	p.notify()
 	p.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// load accounting
+// ---------------------------------------------------------------------------
+
+// BytesPerToken is the tokeniser-free way to talk about prompt size. Rooter does
+// not tokenise, but it does read the body, and for the model family actually in
+// service here body bytes are a close proxy: measured across four cold probes
+// through rooter, 46,857 tokens in 187 KB, 83,335 in 340 KB, 114,772 in 470 KB and
+// 114,774 in 470 KB - 4.00 to 4.10 bytes per token. It is a proxy for routing and
+// deadline arithmetic, not an invoice.
+const BytesPerToken = 4.05
+
+// BeginFlight notes the body rooter is about to send to b, and returns the id
+// EndFlight needs. Only generations are worth noting: a metadata read is not work
+// a box will spend prefill time on.
+func (p *Pool) BeginFlight(b *Backend, bytes int64) int64 {
+	if b == nil || bytes <= 0 {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nextFlightID++
+	id := p.nextFlightID
+	b.inFlight = append(b.inFlight, inFlightReq{ID: id, Bytes: bytes, Since: time.Now()})
+	return id
+}
+
+// EndFlight forgets one noted body. It is deliberately tolerant of an id this box
+// never held, because a retried request is re-noted on the box it lands on and the
+// bookkeeping has to survive a route changing underneath it.
+func (p *Pool) EndFlight(b *Backend, id int64) {
+	if b == nil || id == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, f := range b.inFlight {
+		if f.ID == id {
+			b.inFlight = append(b.inFlight[:i], b.inFlight[i+1:]...)
+			return
+		}
+	}
+}
+
+// ObserveLoad folds one finished call into its backend's load rates. The rate is
+// computed tokens per second of *post-handoff* time: rooter's own queue wait is
+// subtracted, because Estimates is about to predict that wait separately and
+// counting it twice would make a busy box look slower than it is.
+//
+// Two rates, never mixed. A cold sample is one where the runner evaluated at least
+// 2,000 tokens and at least half the prompt - that is fresh work, and it is the
+// number a new prompt should be costed at. A warm sample is one where the runner
+// restored at least 2,000 tokens, which measures prefix restore, typically ten to
+// thirty times faster. Mixing them produces a rate that describes neither box.
+func (p *Pool) ObserveLoad(rec *callRecord) {
+	if rec == nil || rec.TTFTMs <= 0 || rec.Backend == "" {
+		return
+	}
+	postHandoffS := (rec.TTFTMs - rec.WaitMs) / 1000
+	if postHandoffS <= 0 {
+		return
+	}
+	prompt, computed, cached := 0, 0, 0
+	if rec.PromptTokens != nil {
+		prompt = *rec.PromptTokens
+	}
+	if rec.PromptTokensComputed != nil {
+		computed = *rec.PromptTokensComputed
+	}
+	if rec.CachedTokens != nil {
+		cached = *rec.CachedTokens
+	}
+	const alpha = 0.25
+	rate := func(cur float64, seen bool, sample float64) float64 {
+		if !seen {
+			return sample
+		}
+		return cur + alpha*(sample-cur)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b := p.byNameLocked(rec.Backend)
+	if b == nil {
+		return
+	}
+	switch {
+	case computed >= 2000 && (prompt == 0 || computed*2 >= prompt):
+		b.ColdTokS = rate(b.ColdTokS, b.ColdSamples > 0, float64(computed)/postHandoffS)
+		b.ColdSamples++
+	case cached >= 2000:
+		b.RestoreTokS = rate(b.RestoreTokS, b.RestoreSamps > 0, float64(cached)/postHandoffS)
+		b.RestoreSamps++
+	}
+}
+
+// Estimates predicts how long a request of wantBytes would wait for its first byte
+// on each backend, given what those backends are holding right now. Two numbers
+// per box because the honest answer depends on a fact rooter cannot see from
+// outside - whether the box runs its slots in parallel or serialises them:
+//
+//	estFirstByteFreeMs   the box takes the work immediately: own prompt / cold rate
+//	estFirstByteQueuedMs the box finishes what it is holding first, at its cold rate
+//
+// A box with a free slot and one slot total can both be "busy 3 of 4" from here,
+// and they are a factor of several apart in what a new prompt actually waits. Rooter
+// knows its own slots, not the runner's, so both bounds are published and the
+// caller picks the one its deadline should be sized against - which is the queued
+// one, since an estimate that turns out optimistic is a deadline that gets missed.
+//
+// In-flight work is costed as if it were all cold, which over-estimates warm work
+// on purpose: restore is an order of magnitude faster than prefill, so assuming the
+// worst inflates the estimate rather than sinking the caller's deadline.
+func (p *Pool) Estimates(wantBytes int64) map[string]map[string]any {
+	out := map[string]map[string]any{}
+	if wantBytes <= 0 {
+		return out
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	own := float64(wantBytes) / BytesPerToken
+	for _, b := range p.backends {
+		if b.ColdSamples == 0 || b.ColdTokS <= 0 {
+			continue // no observation, no claim
+		}
+		var backlog, longest float64
+		for _, f := range b.inFlight {
+			remain := float64(f.Bytes)/BytesPerToken - now.Sub(f.Since).Seconds()*b.ColdTokS
+			if remain < 0 {
+				remain = 0
+			}
+			backlog += remain
+			if remain > longest {
+				longest = remain
+			}
+		}
+		out[b.Name] = map[string]any{
+			"queuedTokens":          int64(backlog + 0.5),
+			"ownTokens":             int64(own + 0.5),
+			"coldPrefillTokS":       round1(b.ColdTokS),
+			"estFirstByteFreeMs":    int64(own/b.ColdTokS*1000 + 0.5),
+			"estFirstByteQueuedMs":  int64((backlog+own)/b.ColdTokS*1000 + 0.5),
+			"estFirstByteMaxSlotMs": int64((longest+own)/b.ColdTokS*1000 + 0.5),
+		}
+	}
+	return out
+}
+
+// MergeEstimates adds each backend's estimate into an already-rendered
+// /rooter/backends document, keyed by name. It returns the input unchanged if the
+// document is not the shape it expects, or if there is nothing to add: an estimate
+// is a bonus on a working endpoint, never a way to break one.
+func (p *Pool) MergeEstimates(rendered []byte, wantBytes int64) []byte {
+	est := p.Estimates(wantBytes)
+	if len(est) == 0 {
+		return rendered
+	}
+	var docs []map[string]any
+	if err := json.Unmarshal(rendered, &docs); err != nil {
+		return rendered
+	}
+	for _, d := range docs {
+		name, _ := d["name"].(string)
+		if e, ok := est[name]; ok {
+			for k, v := range e {
+				d[k] = v
+			}
+		}
+	}
+	out, err := json.MarshalIndent(docs, "", "  ")
+	if err != nil {
+		return rendered
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

@@ -317,6 +317,11 @@ func (t *tokAcc) add(rec *callRecord) {
 // from settle, which means it runs on the panic path too - the abandonment case
 // is precisely the one that used to vanish.
 func (r *Router) observeCall(rec *callRecord) {
+	// Load rates are fed before the quiet switch, not after it. -no-meta -quiet turns
+	// off the record ring and the per-model stats, which is a request to stop writing
+	// detail down; it is not a request to stop knowing how busy the boxes are, and the
+	// two floats this costs are the cheapest accounting in rooter.
+	r.pool.ObserveLoad(rec)
 	if r.cfg.NoMeta && r.cfg.Quiet {
 		return
 	}
