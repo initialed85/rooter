@@ -322,7 +322,16 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer func() {
 		if p := recover(); p != nil {
 			if p == http.ErrAbortHandler {
-				res = attempt{status: statusAborted, err: errAborted, wrote: true, ttfb: res.ttfb}
+				// dispatch never returned, so `res` is still its zero value, and reading
+				// ttfb and bytes out of it recorded every abandoned stream as a call that
+				// never received a byte. Live proof of the lie: all 5,756 abandoned
+				// generations in the retained log carry bytes=0 ttfb=0, which is not a
+				// plausible distribution and made "was it queued, was it prefill, was it
+				// decode?" unanswerable for 42% of the fleet's generations. replyWriter
+				// holds what actually reached the client, and it is written only from this
+				// goroutine, so reading it while unwinding is safe.
+				res = attempt{status: statusAborted, err: errAborted, wrote: rw.wrote,
+					bytes: rw.bytes, ttfb: rw.ttfb}
 				aborted = true
 			} else {
 				r.settle(rw, req, &res, held, info, &out, start, slot, aborted, rec)
